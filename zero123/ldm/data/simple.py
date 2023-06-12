@@ -167,9 +167,10 @@ class NfpDataset(Dataset):
 
 class ObjaverseDataModuleFromConfig(pl.LightningDataModule):
     def __init__(self, root_dir, batch_size, total_view, train=None, validation=None,
-                 test=None, num_workers=4, **kwargs):
+                 test=None, num_workers=4, data_config_file=None, **kwargs):
         super().__init__(self)
         self.root_dir = root_dir
+        self.data_config_file = data_config_file
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.total_view = total_view
@@ -190,19 +191,20 @@ class ObjaverseDataModuleFromConfig(pl.LightningDataModule):
 
     def train_dataloader(self):
         dataset = ObjaverseData(root_dir=self.root_dir, total_view=self.total_view, validation=False, \
-                                image_transforms=self.image_transforms)
+                                image_transforms=self.image_transforms, data_config_file=self.data_config_file)
         sampler = DistributedSampler(dataset)
         return wds.WebLoader(dataset, batch_size=self.batch_size, num_workers=self.num_workers, shuffle=False, sampler=sampler)
 
     def val_dataloader(self):
         dataset = ObjaverseData(root_dir=self.root_dir, total_view=self.total_view, validation=True, \
-                                image_transforms=self.image_transforms)
+                                image_transforms=self.image_transforms, data_config_file=self.data_config_file)
         sampler = DistributedSampler(dataset)
         return wds.WebLoader(dataset, batch_size=self.batch_size, num_workers=self.num_workers, shuffle=False)
     
     def test_dataloader(self):
-        return wds.WebLoader(ObjaverseData(root_dir=self.root_dir, total_view=self.total_view, validation=self.validation),\
-                          batch_size=self.batch_size, num_workers=self.num_workers, shuffle=False)
+        return wds.WebLoader(ObjaverseData(root_dir=self.root_dir, total_view=self.total_view, validation=self.validation,
+                                           data_config_file=self.data_config_file),
+                             batch_size=self.batch_size, num_workers=self.num_workers, shuffle=False)
 
 
 class ObjaverseData(Dataset):
@@ -214,7 +216,8 @@ class ObjaverseData(Dataset):
         postprocess=None,
         return_paths=False,
         total_view=12,
-        validation=False
+        validation=False,
+        data_config_file=None
         ) -> None:
         """Create a dataset from a folder of images.
         If you pass in a root directory it will be searched for images
@@ -231,7 +234,8 @@ class ObjaverseData(Dataset):
         if not isinstance(ext, (tuple, list, ListConfig)):
             ext = [ext]
 
-        with open(os.path.join(root_dir, 'valid_paths.json')) as f:
+        data_config_path = data_config_file if data_config_file else os.path.join(root_dir, 'valid_paths.json')
+        with open(data_config_path) as f:
             self.paths = json.load(f)
             
         total_objects = len(self.paths)
@@ -298,20 +302,24 @@ class ObjaverseData(Dataset):
         
         color = [1., 1., 1., 1.]
 
-        try:
-            target_im = self.process_im(self.load_im(os.path.join(filename, '%03d.png' % index_target), color))
-            cond_im = self.process_im(self.load_im(os.path.join(filename, '%03d.png' % index_cond), color))
-            target_RT = np.load(os.path.join(filename, '%03d.npy' % index_target))
-            cond_RT = np.load(os.path.join(filename, '%03d.npy' % index_cond))
-        except:
-            # very hacky solution, sorry about this
-            filename = os.path.join(self.root_dir, '692db5f2d3a04bb286cb977a7dba903e_1') # this one we know is valid
-            target_im = self.process_im(self.load_im(os.path.join(filename, '%03d.png' % index_target), color))
-            cond_im = self.process_im(self.load_im(os.path.join(filename, '%03d.png' % index_cond), color))
-            target_RT = np.load(os.path.join(filename, '%03d.npy' % index_target))
-            cond_RT = np.load(os.path.join(filename, '%03d.npy' % index_cond))
-            target_im = torch.zeros_like(target_im)
-            cond_im = torch.zeros_like(cond_im)
+        target_im = self.process_im(self.load_im(os.path.join(filename, '%03d.png' % index_target), color))
+        cond_im = self.process_im(self.load_im(os.path.join(filename, '%03d.png' % index_cond), color))
+        target_RT = np.load(os.path.join(filename, '%03d.npy' % index_target))
+        cond_RT = np.load(os.path.join(filename, '%03d.npy' % index_cond))
+        # try:
+        #     target_im = self.process_im(self.load_im(os.path.join(filename, '%03d.png' % index_target), color))
+        #     cond_im = self.process_im(self.load_im(os.path.join(filename, '%03d.png' % index_cond), color))
+        #     target_RT = np.load(os.path.join(filename, '%03d.npy' % index_target))
+        #     cond_RT = np.load(os.path.join(filename, '%03d.npy' % index_cond))
+        # except:
+        #     # very hacky solution, sorry about this
+        #     filename = os.path.join(self.root_dir, '692db5f2d3a04bb286cb977a7dba903e_1') # this one we know is valid
+        #     target_im = self.process_im(self.load_im(os.path.join(filename, '%03d.png' % index_target), color))
+        #     cond_im = self.process_im(self.load_im(os.path.join(filename, '%03d.png' % index_cond), color))
+        #     target_RT = np.load(os.path.join(filename, '%03d.npy' % index_target))
+        #     cond_RT = np.load(os.path.join(filename, '%03d.npy' % index_cond))
+        #     target_im = torch.zeros_like(target_im)
+        #     cond_im = torch.zeros_like(cond_im)
 
         data["image_target"] = target_im
         data["image_cond"] = cond_im
