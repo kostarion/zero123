@@ -251,9 +251,9 @@ class ImageLogger(Callback):
         grids = dict()
         for k in images:
             grid = torchvision.utils.make_grid(images[k])
-            grids[f"{split}_imgs/{k}"] = wandb.Image(grid)
-            # pl_module.logger.experiment.add_image(f"{split}_imgs/{k}", )
-        pl_module.logger.experiment.log(grids)
+            pl_module.logger.log_image(f"{split}_imgs/{k}", grid, step=pl_module.global_step)
+            # grids[f"{split}_imgs/{k}"] = wandb.Image(grid)
+        # pl_module.logger.experiment.log(grids, step=pl_module.global_step)
 
     @rank_zero_only
     def log_local(self, save_dir, split, images,
@@ -486,6 +486,7 @@ if __name__ == "__main__":
                     "save_dir": logdir,
                     "offline": opt.debug,
                     "id": nowname,
+                    # "log_model": "all",
                 }
             },
             "testtube": {
