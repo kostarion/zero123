@@ -18,10 +18,12 @@ import csv
 import cv2
 import random
 import matplotlib.pyplot as plt
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, ConcatDataset
 import json
 import os, sys
 import webdataset as wds
+import io
+import tarfile
 import math
 from torch.utils.data.distributed import DistributedSampler
 
@@ -205,6 +207,165 @@ class ObjaverseDataModuleFromConfig(pl.LightningDataModule):
         return wds.WebLoader(ObjaverseData(root_dir=self.root_dir, total_view=self.total_view, validation=self.validation,
                                            data_config_file=self.data_config_file),
                              batch_size=self.batch_size, num_workers=self.num_workers, shuffle=False)
+
+
+class ExtendedObjaverseDataModuleFromConfig(pl.LightningDataModule):
+    def __init__(self, datasets, batch_size, total_view, train=None, validation=None,
+                 test=None, num_workers=4, **kwargs):
+        super().__init__(self)
+        for dataset_params in datasets:
+            assert 'root_dir' in dataset_params and 'data_config_file' in dataset_params
+        self.datasets_params = datasets
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.total_view = total_view
+
+        if train is not None:
+            dataset_config = train
+        if validation is not None:
+            dataset_config = validation
+
+        if 'image_transforms' in dataset_config:
+            image_transforms = [torchvision.transforms.Resize(dataset_config.image_transforms.size)]
+        else:
+            image_transforms = []
+        image_transforms.extend([transforms.ToTensor(),
+                                transforms.Lambda(lambda x: rearrange(x * 2. - 1., 'c h w -> h w c'))])
+        self.image_transforms = torchvision.transforms.Compose(image_transforms)
+
+    def train_dataloader(self):
+        datasets = [ExtendedObjaverseData(
+            root_dir=dataset_params.root_dir,
+            meta_dir=dataset_params.meta_dir if 'meta_dir' in dataset_params else None,
+            data_config_file=dataset_params.data_config_file,
+            total_view=self.total_view,
+            validation=False,
+            image_transforms=self.image_transforms) for dataset_params in self.datasets_params]
+        dataset = ConcatDataset(datasets)
+        sampler = DistributedSampler(dataset)
+        return wds.WebLoader(dataset, batch_size=self.batch_size, num_workers=self.num_workers, shuffle=False, sampler=sampler)
+
+    def val_dataloader(self):
+        datasets = [ExtendedObjaverseData(
+            root_dir=dataset_params.root_dir,
+            meta_dir=dataset_params.meta_dir if 'meta_dir' in dataset_params else None,
+            data_config_file=dataset_params.data_config_file,
+            total_view=self.total_view, validation=True,
+            image_transforms=self.image_transforms) for dataset_params in self.datasets_params]
+        dataset = ConcatDataset(datasets)
+        # sampler = DistributedSampler(dataset)
+        return wds.WebLoader(dataset, batch_size=self.batch_size, num_workers=self.num_workers, shuffle=False)
+    
+    def test_dataloader(self):
+        datasets = [ExtendedObjaverseData(
+            root_dir=dataset_params.root_dir,
+            meta_dir=dataset_params.meta_dir if 'meta_dir' in dataset_params else None,
+            data_config_file=dataset_params.data_config_file,
+            total_view=self.total_view, validation=self.validation) for dataset_params in self.datasets_params]
+        dataset = ConcatDataset(datasets)
+        return wds.WebLoader(dataset, batch_size=self.batch_size, num_workers=self.num_workers, shuffle=False)
+
+
+class ExtendedObjaverseData(Dataset):
+    def __init__(self,
+        root_dir='.objaverse/hf-objaverse-v1/views',
+        meta_dir=None,
+        data_config_file=None,
+        image_transforms=[],
+        postprocess=None,
+        return_paths=False,
+        total_view=54,
+        validation=False,
+        ) -> None:
+        """Create a dataset from a folder of images.
+        If you pass in a root directory it will be searched for images
+        ending in ext (ext can be a list)
+        """
+        print("********** ", root_dir)
+        self.root_dir = Path(root_dir)
+        self.return_paths = return_paths
+        if isinstance(postprocess, DictConfig):
+            postprocess = instantiate_from_config(postprocess)
+        self.postprocess = postprocess
+        self.total_view = total_view
+
+        self.meta_dir = meta_dir if meta_dir else root_dir
+
+        data_config_path = data_config_file if data_config_file else os.path.join(root_dir, 'valid_paths.json')
+        with open(data_config_path) as f:
+            self.paths = json.load(f)
+            
+        total_objects = len(self.paths)
+        if validation:
+            self.paths = self.paths[math.floor(total_objects / 100. * 99.):] # used last 1% as validation
+        else:
+            self.paths = self.paths[:math.floor(total_objects / 100. * 99.)] # used first 99% as training
+        print('============= length of dataset %d =============' % len(self.paths))
+        self.tform = image_transforms
+
+    def __len__(self):
+        return len(self.paths)
+
+    def load_img(self, tar, tar_name, index, prefix='rgba/rgba_'):
+        image = tar.extractfile(f'{tar_name}/{prefix}{index:04d}.png').read()
+        image = Image.open(io.BytesIO(image))
+        return image
+
+    def process_img(self, img):
+        img = img.convert("RGB")
+        return self.tform(img) if self.tform else img
+
+    def load_viewpoint(self, tar, tar_name, index, prefix='frame_'):
+        metas = tar.extractfile(f'{tar_name}/{prefix}{index:04d}.json').read()
+        metas = json.loads(metas)
+        polar, azimuth, r = metas["polar"], metas["azimuth"], metas["r"]
+        return polar, azimuth, r
+
+    def get_T(self, tar, tar_name, index_cond, index_target):
+        target_polar, target_azimuth, target_r = self.load_viewpoint(tar, tar_name, index_target)
+        cond_polar, cond_azimuth, cond_r = self.load_viewpoint(tar, tar_name, index_cond)
+        
+        d_polar = target_polar - cond_polar
+        d_azimuth = (target_azimuth - cond_azimuth) % (2 * math.pi)
+        d_r = target_r - cond_r
+        
+        d_T = torch.tensor([d_polar, math.sin(d_azimuth), math.cos(d_azimuth), d_r])
+        return d_T
+
+    def __getitem__(self, index):
+        data = {}
+        # TODO: set seed
+        tar_filename = os.path.join(self.root_dir, self.paths[index])
+        tar_name = Path(tar_filename).stem
+        tar = tarfile.open(tar_filename)
+        metas_tar = tar if self.root_dir == self.meta_dir else tarfile.open(os.path.join(self.meta_dir, self.paths[index]))
+        if self.return_paths:
+            data["path"] = str(tar_filename)
+        
+        # TODO: remove
+        tar_files = tar.getnames()
+        total_view = self.total_view if f"{tar_name}/rgba/rgba_0053.png" in tar_files else 48
+        if not f"{tar_name}/rgba/rgba_0047.png" in tar_files:
+            print(f"==== Invalid object {tar_name} ====")
+            return self.__getitem__((index + 1) % len(self.paths))
+
+        try:
+            index_target, index_cond = random.sample(range(total_view), 2) # without replacement
+            target_img = self.process_img(self.load_img(tar, tar_name, index_target))
+            cond_img = self.process_img(self.load_img(tar, tar_name, index_cond))
+            viewpoints_T = self.get_T(metas_tar, tar_name, index_cond, index_target)
+        except:
+            print(f"************* Invalid files {tar_filename} ***************")
+            return self.__getitem__((index + 1) % len(self.paths))
+        
+        data["image_target"] = target_img
+        data["image_cond"] = cond_img
+        data["T"] = viewpoints_T
+
+        if self.postprocess is not None:
+            data = self.postprocess(data)
+
+        return data
 
 
 class ObjaverseData(Dataset):
