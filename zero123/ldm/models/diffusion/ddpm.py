@@ -487,6 +487,7 @@ class LatentDiffusion(DDPM):
                  cond_stage_config,
                  num_timesteps_cond=None,
                  cond_stage_key="image",
+                 cond_stage_embedding_key=None,
                  cond_stage_trainable=False,
                  concat_mode=True,
                  cond_stage_forward=None,
@@ -510,6 +511,7 @@ class LatentDiffusion(DDPM):
         self.cond_stage_trainable = cond_stage_trainable
         self.unet_trainable = unet_trainable
         self.cond_stage_key = cond_stage_key
+        self.cond_stage_embedding_key = cond_stage_embedding_key
         try:
             self.num_downs = len(first_stage_config.params.ddconfig.ch_mult) - 1
         except:
@@ -520,6 +522,7 @@ class LatentDiffusion(DDPM):
             self.register_buffer('scale_factor', torch.tensor(scale_factor))
         self.instantiate_first_stage(first_stage_config)
         self.instantiate_cond_stage(cond_stage_config)
+        assert not self.cond_stage_precomputed or cond_stage_embedding_key
         self.cond_stage_forward = cond_stage_forward
 
         # construct linear projection layer for concatenating image CLIP embedding and RT
@@ -568,6 +571,12 @@ class LatentDiffusion(DDPM):
             self.make_cond_schedule()
 
     def instantiate_first_stage(self, config):
+        self.first_stage_precomputed = False
+        if config == "__is_identity__":
+            print("Using identity as first stage.")
+            self.first_stage_precomputed = True
+            self.first_stage_model = None
+            return
         model = instantiate_from_config(config)
         self.first_stage_model = model.eval()
         self.first_stage_model.train = disabled_train
@@ -575,6 +584,7 @@ class LatentDiffusion(DDPM):
             param.requires_grad = False
 
     def instantiate_cond_stage(self, config):
+        self.cond_stage_precomputed = False
         if not self.cond_stage_trainable:
             if config == "__is_first_stage__":
                 print("Using first stage also as cond stage.")
@@ -583,6 +593,10 @@ class LatentDiffusion(DDPM):
                 print(f"Training {self.__class__.__name__} as an unconditional model.")
                 self.cond_stage_model = None
                 # self.be_unconditional = True
+            elif config == "__is_identity__":
+                print("Using identity as cond stage.")
+                self.cond_stage_precomputed = True
+                self.cond_stage_model = None
             else:
                 model = instantiate_from_config(config)
                 self.cond_stage_model = model.eval()
@@ -592,6 +606,7 @@ class LatentDiffusion(DDPM):
         else:
             assert config != '__is_first_stage__'
             assert config != '__is_unconditional__'
+            assert config != '__is_identity__'
             model = instantiate_from_config(config)
             self.cond_stage_model = model
 
@@ -609,7 +624,8 @@ class LatentDiffusion(DDPM):
 
     def get_first_stage_encoding(self, encoder_posterior):
         if isinstance(encoder_posterior, DiagonalGaussianDistribution):
-            z = encoder_posterior.sample()
+            # z = encoder_posterior.sample()
+            z = encoder_posterior.mode() # TODO: THIS IS DIFFERENT FROM THE ORIGINAL SETUP
         elif isinstance(encoder_posterior, torch.Tensor):
             z = encoder_posterior
         else:
@@ -718,45 +734,117 @@ class LatentDiffusion(DDPM):
 
         return fold, unfold, normalization, weighting
 
+    def get_input_latent(self, batch, k):
+        x = batch[k]
+        assert len(x.shape) == 4 and x.shape[1:] == (4, 32, 32)
+        # x = rearrange(x, 'b h w c -> b c h w')
+        x = x.to(memory_format=torch.contiguous_format).float()
+        return x
+
+    def get_input_embedding(self, batch, k):
+        x = batch[k]
+        assert len(x.shape) == 3 and x.shape[1] == 1
+        # x = rearrange(x, 'b h w c -> b c h w')
+        x = x.to(memory_format=torch.contiguous_format).float()
+        return x
     
+    # @torch.no_grad()
+    # def get_input(self, batch, k, return_first_stage_outputs=False, force_c_encode=False,
+    #               cond_key=None, return_original_cond=False, bs=None, uncond=0.05):
+    #     x = super().get_input(batch, k)
+    #     T = batch['T'].to(memory_format=torch.contiguous_format).float()
+        
+    #     if bs is not None:
+    #         x = x[:bs]
+    #         T = T[:bs].to(self.device)
+
+    #     x = x.to(self.device)
+    #     encoder_posterior = self.encode_first_stage(x)
+    #     z = self.get_first_stage_encoding(encoder_posterior).detach()
+    #     cond_key = cond_key or self.cond_stage_key
+    #     xc = super().get_input(batch, cond_key).to(self.device)
+    #     if bs is not None:
+    #         xc = xc[:bs]
+    #     cond = {}
+
+    #     # To support classifier-free guidance, randomly drop out only text conditioning 5%, only image conditioning 5%, and both 5%.
+    #     random = torch.rand(x.size(0), device=x.device)
+    #     prompt_mask = rearrange(random < 2 * uncond, "n -> n 1 1")
+    #     input_mask = 1 - rearrange((random >= uncond).float() * (random < 3 * uncond).float(), "n -> n 1 1 1")
+    #     null_prompt = self.get_learned_conditioning([""])
+
+    #     # z.shape: [8, 4, 64, 64]; c.shape: [8, 1, 768]
+    #     # print('=========== xc shape ===========', xc.shape)
+    #     with torch.enable_grad():
+    #         clip_emb = self.get_learned_conditioning(xc).detach()
+    #         null_prompt = self.get_learned_conditioning([""]).detach()
+    #         cond["c_crossattn"] = [self.cc_projection(torch.cat([torch.where(prompt_mask, null_prompt, clip_emb), T[:, None, :]], dim=-1))]
+    #     cond["c_concat"] = [input_mask * self.encode_first_stage((xc.to(self.device))).mode().detach()]
+    #     out = [z, cond]
+    #     if return_first_stage_outputs:
+    #         xrec = self.decode_first_stage(z)
+    #         out.extend([x, xrec])
+    #     if return_original_cond:
+    #         out.append(xc)
+    #     return out
+
     @torch.no_grad()
     def get_input(self, batch, k, return_first_stage_outputs=False, force_c_encode=False,
                   cond_key=None, return_original_cond=False, bs=None, uncond=0.05):
-        x = super().get_input(batch, k)
         T = batch['T'].to(memory_format=torch.contiguous_format).float()
+        if bs is not None:
+            T = T[:bs].to(self.device)
+        
+        cond_key = cond_key or self.cond_stage_key
+        if not self.first_stage_precomputed:
+            x = super().get_input(batch, k).to(self.device)
+            xc = super().get_input(batch, cond_key).to(self.device)
+            if bs is not None:
+                x = x[:bs]
+                xc = xc[:bs]
+            encoder_posterior = self.encode_first_stage(x)
+            z = self.get_first_stage_encoding(encoder_posterior).detach()
+            z_cond = self.encode_first_stage(xc).mode().detach()
+        else:
+            z = self.get_input_latent(batch, k).to(self.device)
+            z_cond = self.get_input_latent(batch, cond_key).to(self.device)
+            if bs is not None:
+                z = z[:bs]
+                z_cond = z_cond[:bs]
+
+        if not self.cond_stage_precomputed:
+            if self.first_stage_precomputed:
+                raise NotImplementedError
+            clip_emb = self.get_learned_conditioning(xc).detach()
+            null_prompt = self.get_learned_conditioning([""]).detach()
+        else:
+            clip_emb = self.get_input_embedding(batch, self.cond_stage_embedding_key).to(self.device)
+            null_prompt = torch.zeros_like(clip_emb).to(self.device)
         
         if bs is not None:
-            x = x[:bs]
-            T = T[:bs].to(self.device)
-
-        x = x.to(self.device)
-        encoder_posterior = self.encode_first_stage(x)
-        z = self.get_first_stage_encoding(encoder_posterior).detach()
-        cond_key = cond_key or self.cond_stage_key
-        xc = super().get_input(batch, cond_key).to(self.device)
-        if bs is not None:
-            xc = xc[:bs]
+            clip_emb = clip_emb[:bs]
+            null_prompt = null_prompt[:bs]
         cond = {}
 
         # To support classifier-free guidance, randomly drop out only text conditioning 5%, only image conditioning 5%, and both 5%.
-        random = torch.rand(x.size(0), device=x.device)
+        random = torch.rand(T.size(0), device=self.device)
         prompt_mask = rearrange(random < 2 * uncond, "n -> n 1 1")
         input_mask = 1 - rearrange((random >= uncond).float() * (random < 3 * uncond).float(), "n -> n 1 1 1")
-        null_prompt = self.get_learned_conditioning([""])
 
         # z.shape: [8, 4, 64, 64]; c.shape: [8, 1, 768]
         # print('=========== xc shape ===========', xc.shape)
         with torch.enable_grad():
-            clip_emb = self.get_learned_conditioning(xc).detach()
-            null_prompt = self.get_learned_conditioning([""]).detach()
-            cond["c_crossattn"] = [self.cc_projection(torch.cat([torch.where(prompt_mask, null_prompt, clip_emb), T[:, None, :]], dim=-1))]
-        cond["c_concat"] = [input_mask * self.encode_first_stage((xc.to(self.device))).mode().detach()]
+            concat_cond = torch.cat([torch.where(prompt_mask, null_prompt, clip_emb), T[:, None, :]], dim=-1)
+            cond["c_crossattn"] = [self.cc_projection(concat_cond)]
+        cond["c_concat"] = [input_mask * z_cond]
         out = [z, cond]
         if return_first_stage_outputs:
             xrec = self.decode_first_stage(z)
             out.extend([x, xrec])
         if return_original_cond:
             out.append(xc)
+        # print(out)
+        # raise Exception
         return out
 
     # @torch.no_grad()
@@ -1019,7 +1107,7 @@ class LatentDiffusion(DDPM):
         loss_simple = self.get_loss(model_output, target, mean=False).mean([1, 2, 3])
         loss_dict.update({f'{prefix}/loss_simple': loss_simple.mean()})
 
-        logvar_t = self.logvar[t].to(self.device)
+        logvar_t = self.logvar.to(t.device)[t].to(self.device)
         loss = loss_simple / torch.exp(logvar_t) + logvar_t
         # loss = loss_simple / torch.exp(self.logvar) + self.logvar
         if self.learn_logvar:
