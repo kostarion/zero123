@@ -25,6 +25,8 @@ import webdataset as wds
 import io
 import tarfile
 import math
+import re
+from safetensors.torch import load as load_sftr
 from torch.utils.data.distributed import DistributedSampler
 
 # Some hacky things to make experimentation easier
@@ -210,15 +212,16 @@ class ObjaverseDataModuleFromConfig(pl.LightningDataModule):
 
 
 class ExtendedObjaverseDataModuleFromConfig(pl.LightningDataModule):
-    def __init__(self, datasets, batch_size, total_view, train=None, validation=None,
-                 test=None, num_workers=4, **kwargs):
+    def __init__(self, datasets, batch_size, total_view, load_tensors=False,
+                 train=None, validation=None, test=None, num_workers=4, **kwargs):
         super().__init__(self)
         for dataset_params in datasets:
             assert 'root_dir' in dataset_params and 'data_config_file' in dataset_params
         self.datasets_params = datasets
         self.batch_size = batch_size
-        self.num_workers = num_workers
+        self.load_tensors = load_tensors
         self.total_view = total_view
+        self.num_workers = num_workers
 
         if train is not None:
             dataset_config = train
@@ -229,8 +232,9 @@ class ExtendedObjaverseDataModuleFromConfig(pl.LightningDataModule):
             image_transforms = [torchvision.transforms.Resize(dataset_config.image_transforms.size)]
         else:
             image_transforms = []
-        image_transforms.extend([transforms.ToTensor(),
-                                transforms.Lambda(lambda x: rearrange(x * 2. - 1., 'c h w -> h w c'))])
+        if not self.load_tensors:
+            image_transforms.extend([transforms.ToTensor(),
+                                    transforms.Lambda(lambda x: rearrange(x * 2. - 1., 'c h w -> h w c'))])
         self.image_transforms = torchvision.transforms.Compose(image_transforms)
 
     def train_dataloader(self):
@@ -238,6 +242,7 @@ class ExtendedObjaverseDataModuleFromConfig(pl.LightningDataModule):
             root_dir=dataset_params.root_dir,
             meta_dir=dataset_params.meta_dir if 'meta_dir' in dataset_params else None,
             data_config_file=dataset_params.data_config_file,
+            load_tensors=self.load_tensors,
             total_view=self.total_view,
             validation=False,
             image_transforms=self.image_transforms) for dataset_params in self.datasets_params]
@@ -250,7 +255,9 @@ class ExtendedObjaverseDataModuleFromConfig(pl.LightningDataModule):
             root_dir=dataset_params.root_dir,
             meta_dir=dataset_params.meta_dir if 'meta_dir' in dataset_params else None,
             data_config_file=dataset_params.data_config_file,
-            total_view=self.total_view, validation=True,
+            load_tensors=self.load_tensors,
+            total_view=self.total_view,
+            validation=True,
             image_transforms=self.image_transforms) for dataset_params in self.datasets_params]
         dataset = ConcatDataset(datasets)
         # sampler = DistributedSampler(dataset)
@@ -261,7 +268,9 @@ class ExtendedObjaverseDataModuleFromConfig(pl.LightningDataModule):
             root_dir=dataset_params.root_dir,
             meta_dir=dataset_params.meta_dir if 'meta_dir' in dataset_params else None,
             data_config_file=dataset_params.data_config_file,
-            total_view=self.total_view, validation=self.validation) for dataset_params in self.datasets_params]
+            total_view=self.total_view,
+            load_tensors=self.load_tensors,
+            validation=self.validation) for dataset_params in self.datasets_params]
         dataset = ConcatDataset(datasets)
         return wds.WebLoader(dataset, batch_size=self.batch_size, num_workers=self.num_workers, shuffle=False)
 
@@ -271,6 +280,7 @@ class ExtendedObjaverseData(Dataset):
         root_dir='.objaverse/hf-objaverse-v1/views',
         meta_dir=None,
         data_config_file=None,
+        load_tensors=False,
         image_transforms=[],
         postprocess=None,
         return_paths=False,
@@ -288,6 +298,7 @@ class ExtendedObjaverseData(Dataset):
             postprocess = instantiate_from_config(postprocess)
         self.postprocess = postprocess
         self.total_view = total_view
+        self.load_tensors = load_tensors
 
         self.meta_dir = meta_dir if meta_dir else root_dir
 
@@ -306,13 +317,18 @@ class ExtendedObjaverseData(Dataset):
     def __len__(self):
         return len(self.paths)
 
-    def load_img(self, tar, tar_name, index, prefix='rgba/rgba_'):
-        image = tar.extractfile(f'{tar_name}/{prefix}{index:04d}.png').read()
-        image = Image.open(io.BytesIO(image))
+    def load_img(self, tar, tar_name, index, fname_format_str='rgba/rgba_{view_index:04d}.png'):
+        image = tar.extractfile(f'{tar_name}/{fname_format_str.format(view_index=index)}').read()
+        image = Image.open(io.BytesIO(image)).convert('RGBA')
         return image
+    
+    def load_tensor(self, tar, tar_name, index, color_index=0, fname_format_str='view-{view_index:03d}-c{color_index:02d}.sftr', key='vae_latent'):
+        tensor = tar.extractfile(f'{tar_name}/{fname_format_str.format(view_index=index, color_index=color_index)}').read()
+        return load_sftr(tensor)[key]
 
-    def process_img(self, img):
-        img = img.convert("RGB")
+    def process_img(self, img, background_color=(255, 255, 255)):
+        background = Image.new('RGBA', img.size, background_color)
+        img = Image.alpha_composite(background, img).convert("RGB")
         return self.tform(img) if self.tform else img
 
     def load_viewpoint(self, tar, tar_name, index, prefix='frame_'):
@@ -321,7 +337,7 @@ class ExtendedObjaverseData(Dataset):
         polar, azimuth, r = metas["polar"], metas["azimuth"], metas["r"]
         return polar, azimuth, r
 
-    def get_T(self, tar, tar_name, index_cond, index_target):
+    def get_T(self, tar, tar_name, index_target, index_cond):
         target_polar, target_azimuth, target_r = self.load_viewpoint(tar, tar_name, index_target)
         cond_polar, cond_azimuth, cond_r = self.load_viewpoint(tar, tar_name, index_cond)
         
@@ -331,6 +347,22 @@ class ExtendedObjaverseData(Dataset):
         
         d_T = torch.tensor([d_polar, math.sin(d_azimuth), math.cos(d_azimuth), d_r])
         return d_T
+
+    def extract_data(self, tar, metas_tar, tar_name, index_target, index_cond):
+        data = {}
+        if not self.load_tensors:
+            data["image_target"] = self.process_img(self.load_img(tar, tar_name, index_target))
+            data["image_cond"] = self.process_img(self.load_img(tar, tar_name, index_cond))
+        else:
+            data["latent_target"] = self.load_tensor(tar, tar_name, index_target)
+            data["latent_cond"] = self.load_tensor(tar, tar_name, index_cond)
+            data["clip_emb_cond"] = self.load_tensor(
+                tar, tar_name, index_cond,
+                fname_format_str='clip-{view_index:03d}-c{color_index:02d}.sftr',
+                key='clip_emb')
+        data["T"] = self.get_T(metas_tar, tar_name, index_target, index_cond)
+
+        return data
 
     def __getitem__(self, index):
         data = {}
@@ -342,25 +374,34 @@ class ExtendedObjaverseData(Dataset):
         if self.return_paths:
             data["path"] = str(tar_filename)
         
-        # TODO: remove
+        total_view = self.total_view
         tar_files = tar.getnames()
-        total_view = self.total_view if f"{tar_name}/rgba/rgba_0053.png" in tar_files else 48
-        if not f"{tar_name}/rgba/rgba_0047.png" in tar_files:
+        if self.load_tensors:
+            total_view = len([f for f in tar_files if re.findall(r'view-(\d+)-c00.sftr', f)])
+            total_view = min(total_view, len([f for f in tar_files if re.findall(r'clip-(\d+)-c00.sftr', f)]))
+        else:
+            total_view = len([f for f in tar_files if re.findall(r'rgba/rgba_(\d+).png', f)])
+
+        # TODO: remove
+        if total_view < 48:
             print(f"==== Invalid object {tar_name} ====")
             return self.__getitem__((index + 1) % len(self.paths))
 
         try:
-            index_target, index_cond = random.sample(range(total_view), 2) # without replacement
-            target_img = self.process_img(self.load_img(tar, tar_name, index_target))
-            cond_img = self.process_img(self.load_img(tar, tar_name, index_cond))
-            viewpoints_T = self.get_T(metas_tar, tar_name, index_cond, index_target)
+            # index_target, index_cond = random.sample(range(total_view), 2) # without replacement
+            index_target, index_cond = 2, 1
+            data = self.extract_data(tar, metas_tar, tar_name, index_target, index_cond)
+        except KeyboardInterrupt:
+            raise
         except:
-            print(f"************* Invalid files {tar_filename} ***************")
+            print(f"************* Invalid files {tar_filename} {index_target} {index_cond} ***************")
+            with open("/fsx/proj-mod3d/dmitry/repos/zero123/zero123/invalid_files.txt", "a") as f:
+                f.write(f'{tar_filename}:({index_target}, {index_cond})\n')
+            index_target, index_cond = 1, 2
+            data = self.extract_data(tar, metas_tar, tar_name, index_target, index_cond)
             return self.__getitem__((index + 1) % len(self.paths))
-        
-        data["image_target"] = target_img
-        data["image_cond"] = cond_img
-        data["T"] = viewpoints_T
+
+        data['tar_name'] = tar_name
 
         if self.postprocess is not None:
             data = self.postprocess(data)
