@@ -522,7 +522,7 @@ class LatentDiffusion(DDPM):
             self.register_buffer('scale_factor', torch.tensor(scale_factor))
         self.instantiate_first_stage(first_stage_config)
         self.instantiate_cond_stage(cond_stage_config)
-        assert not self.cond_stage_precomputed or cond_stage_embedding_key
+        # assert not self.cond_stage_precomputed or cond_stage_embedding_key
         self.cond_stage_forward = cond_stage_forward
 
         # construct linear projection layer for concatenating image CLIP embedding and RT

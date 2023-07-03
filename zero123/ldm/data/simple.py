@@ -388,8 +388,8 @@ class ExtendedObjaverseData(Dataset):
             return self.__getitem__((index + 1) % len(self.paths))
 
         try:
-            # index_target, index_cond = random.sample(range(total_view), 2) # without replacement
-            index_target, index_cond = 2, 1
+            index_target, index_cond = random.sample(range(total_view-1), 2) # without replacement
+            # index_target, index_cond = 2, 1
             data = self.extract_data(tar, metas_tar, tar_name, index_target, index_cond)
         except KeyboardInterrupt:
             raise
@@ -401,7 +401,7 @@ class ExtendedObjaverseData(Dataset):
             data = self.extract_data(tar, metas_tar, tar_name, index_target, index_cond)
             return self.__getitem__((index + 1) % len(self.paths))
 
-        data['tar_name'] = tar_name
+        # data['tar_name'] = tar_name
 
         if self.postprocess is not None:
             data = self.postprocess(data)
