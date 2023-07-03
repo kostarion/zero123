@@ -186,7 +186,7 @@ class SetupCallback(Callback):
             os.makedirs(self.cfgdir, exist_ok=True)
 
             if "callbacks" in self.lightning_config:
-                if 'metrics_over_trainsteps_checkpoint' in self.lightning_config['callbacks']:
+                if 'metrics_over_trainsteps_checkpoint' in self.lightning_config:
                     os.makedirs(os.path.join(self.ckptdir, 'trainstep_checkpoints'), exist_ok=True)
             rank_zero_print("Project config")
             rank_zero_print(OmegaConf.to_yaml(self.config))
@@ -251,9 +251,9 @@ class ImageLogger(Callback):
         grids = dict()
         for k in images:
             grid = torchvision.utils.make_grid(images[k])
-            pl_module.logger.log_image(f"{split}_imgs/{k}", grid, step=pl_module.global_step)
-            # grids[f"{split}_imgs/{k}"] = wandb.Image(grid)
-        # pl_module.logger.experiment.log(grids, step=pl_module.global_step)
+            # pl_module.logger.log_image(f"{split}_imgs/{k}", grid, step=pl_module.global_step)
+            grids[f"{split}_imgs/{k}"] = wandb.Image(grid)
+        pl_module.logger.experiment.log(grids, step=pl_module.global_step)
 
     @rank_zero_only
     def log_local(self, save_dir, split, images,
@@ -573,7 +573,7 @@ if __name__ == "__main__":
         else:
             callbacks_cfg = OmegaConf.create()
 
-        if 'metrics_over_trainsteps_checkpoint' in callbacks_cfg:
+        if 'metrics_over_trainsteps_checkpoint' in lightning_config: #callbacks_cfg:
             rank_zero_print(
                 'Caution: Saving checkpoints every n train steps without deleting. This might require some free space.')
             default_metrics_over_trainsteps_ckpt_dict = {
@@ -584,7 +584,7 @@ if __name__ == "__main__":
                          "filename": "{epoch:06}-{step:09}",
                          "verbose": True,
                          'save_top_k': -1,
-                         'every_n_train_steps': 10000,
+                         'every_n_train_steps': 1000,
                          'save_weights_only': True
                      }
                      }
