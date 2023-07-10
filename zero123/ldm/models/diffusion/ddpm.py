@@ -8,6 +8,7 @@ https://github.com/CompVis/taming-transformers
 
 import torch
 import torch.nn as nn
+import math
 import numpy as np
 import pytorch_lightning as pl
 from torch.optim.lr_scheduler import LambdaLR
@@ -1345,6 +1346,57 @@ class LatentDiffusion(DDPM):
         cond["c_crossattn"] = [c]
         cond["c_concat"] = [torch.zeros([batch_size, 4, image_size // 8, image_size // 8]).to(self.device)]
         return cond
+
+    @torch.no_grad()
+    def sample_novel_view(self, cond_emb, cond_latent, x, y, z, ddim_steps=200, scale=3.0, ddim_eta=1.0):
+        sampler = DDIMSampler(self)
+        with self.ema_scope():
+            n_samples = cond_emb.shape[0]
+            
+            T = torch.tensor([math.radians(x), math.sin(
+                math.radians(y)), math.cos(math.radians(y)), z])
+            T = T[None, None, :].repeat(n_samples, 1, 1).to(c.device)
+            c = torch.cat([cond_emb, T], dim=-1)
+            c = self.cc_projection(c)
+            cond = {}
+            cond['c_crossattn'] = [c]
+            cond['c_concat'] = [cond_latent]
+            if scale != 1.0:
+                uc = {}
+                uc['c_concat'] = [torch.zeros(n_samples, 4, self.image_size // 8, self.image_size // 8).to(c.device)]
+                uc['c_crossattn'] = [torch.zeros_like(c).to(c.device)]
+            else:
+                uc = None
+
+            shape = [4, self.image_size // 8, self.image_size // 8]
+            samples_ddim, _ = sampler.sample(S=ddim_steps,
+                                            conditioning=cond,
+                                            batch_size=n_samples,
+                                            shape=shape,
+                                            verbose=False,
+                                            unconditional_guidance_scale=scale,
+                                            unconditional_conditioning=uc,
+                                            eta=ddim_eta,
+                                            x_T=None)
+            # print(samples_ddim.shape)
+            # samples_ddim = torch.nn.functional.interpolate(samples_ddim, 64, mode='nearest', antialias=False)
+            x_samples_ddim = self.decode_first_stage(samples_ddim)
+            return torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0).cpu()
+
+    @torch.no_grad()
+    def log_novel_views(self, imgs, view_angles, names, scales=[3.0]):
+        num_samples = imgs.shape[0]
+        assert num_samples == len(names)
+        imgs = imgs.to(self.device)
+        n_samples = imgs.shape[0]
+        cond_emb = self.get_learned_conditioning(imgs).tile(n_samples, 1, 1)
+        cond_latent = self.encode_first_stage((imgs)).mode().detach().repeat(n_samples, 1, 1, 1)
+        log_batch = torch.empty((num_samples, len(scales), len(view_angles), 3, self.image_size, self.image_size)).to(self.device)
+        for n_view, (x, y, z) in enumerate(view_angles):
+            for n_scale, scale in enumerate(scales):
+                samples = self.sample_novel_views(cond_emb, cond_latent, x, y, z, scale=scale)
+                log_batch[:, n_scale, n_view, ...] = samples
+        return log_batch
 
     @torch.no_grad()
     def log_images(self, batch, N=8, n_row=4, sample=True, ddim_steps=200, ddim_eta=1., return_keys=None,

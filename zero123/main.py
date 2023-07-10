@@ -3,6 +3,7 @@ import numpy as np
 import time
 import torch
 import torchvision
+from torchvision import transforms, datasets
 import pytorch_lightning as pl
 import copy
 import wandb
@@ -11,7 +12,7 @@ from packaging import version
 from omegaconf import OmegaConf
 from torch.utils.data import random_split, DataLoader, Dataset, Subset
 from functools import partial
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 from pytorch_lightning import seed_everything
 from pytorch_lightning.trainer import Trainer
@@ -211,6 +212,89 @@ class SetupCallback(Callback):
                     os.rename(self.logdir, dst)
                 except FileNotFoundError:
                     pass
+
+
+class TestImagesLogger(Callback):
+    def __init__(self, test_images_dir, view_angles, epoch_frequency=5, image_size=256,
+                 cfg_scales=[3.0], view_names=[], batch_size=-1, disabled=False) -> None:
+        super().__init__()
+        self.test_images_dir = test_images_dir
+        self.view_angles = view_angles
+        self.view_names = view_names if view_names else [str(v) for v in view_angles]
+        assert len(self.view_names) == len(self.view_angles)
+        self.image_size = image_size
+        self.epoch_frequency = epoch_frequency
+        self.cfg_scales = cfg_scales
+        self.cfg_scale_names = [f'cfg_scale_{s}' for s in cfg_scales]
+        if not 1.0 in cfg_scales:
+            self.cfg_scales.append(1.0)
+        self.cfg_scales = sorted(self.cfg_scales)
+        self.disabled = disabled
+        image_transforms = [transforms.Resize(self.image_size),
+                            transforms.ToTensor(),
+                            transforms.Lambda(lambda x: x * 2. - 1.)]
+        self.image_transforms = transforms.Compose(image_transforms)
+        self.dataset = datasets.ImageFolder(root=self.test_images_dir, transform=self.image_transforms)
+        self.batch_size = len(self.dataset) if batch_size == -1 else batch_size
+        self.names = [os.path.basename(x[0]).split('.')[0] for x in self.dataset.imgs]
+        self.loader = DataLoader(
+            self.dataset,
+            batch_size=self.batch_size,
+            shuffle=False)
+
+    def _create_text_image(self, text, width, height, font_size):
+        img = Image.new('RGB', (width, height), color = 'white')
+        draw = ImageDraw.Draw(img)
+        font = ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf', font_size)
+        # font = ImageFont.load_default(font_size=font_size)
+        text_width, text_height = draw.textsize(text, font=font)
+        x = (width - text_width) / 2
+        y = (height - text_height) / 2
+        # draw the text on the image
+        draw.text((x, y), text, font=font, fill=(0, 0, 0))
+        return img
+    
+    def _create_image_grid(self, image_batch, image_original, col_names, row_names, label_size=20):
+        imsize = self.image_size
+        imgs_grid = torchvision.utils.make_grid(image_batch.view(-1, 3, imsize, imsize), nrow=len(col_names), padding=0)
+
+        full_grid = torch.ones(3, imsize * (len(row_names) + 1), imsize * (len(col_names) + 1))
+        full_grid[:, imsize:, imsize:] = image_original
+        full_grid[:, imsize:, imsize:] = imgs_grid
+
+        for i, row_name in enumerate(row_names):
+            label_img = transforms.ToTensor()(self._create_text_image(row_name, imsize, imsize, label_size))
+            full_grid[:, imsize * (i + 1):imsize * (i + 2), :imsize] = label_img
+        for i, col_name in enumerate(col_names):
+            label_img = transforms.ToTensor()(self._create_text_image(col_name, imsize, imsize, label_size))
+            full_grid[:, :imsize, imsize * (i + 1):imsize * (i + 2)] = label_img
+        return full_grid
+
+    def log_views(self, pl_module, epoch_number, label="challenges"):
+        local_root = os.path.join(pl_module.logger.save_dir, label)
+        os.makedirs(local_root, exist_ok=True)
+        if (epoch_number % self.epoch_frequency == 0) and hasattr(pl_module, "log_novel_view") and callable(
+                pl_module.log_novel_view):
+            for i, img_batch in enumerate(self.loader):
+                names = self.names[i*self.batch_size : (i+1)*self.batch_size]
+                novel_views = pl_module.log_novel_views(
+                    img_batch, self.view_angles, names=names, scales=self.cfg_scales)
+                grids = [self._create_image_grid(
+                    novel_views[img_num], img_batch[img_num], self.view_names, self.cfg_scale_names) for img_num in range(len(img_batch))]
+                
+                for name, grid in zip(names, grids):
+                    if self.log_wandb:
+                        pl_module.logger.experiment.log({f'challenges/{name}': grid}, step=pl_module.global_step)
+                    if self.log_local:
+                        filename = f"{name}_gs-{pl_module.global_step:06d}_e-{pl_module.current_epoch:06}.png"
+                        path = os.path.join(local_root, filename)
+                        os.makedirs(os.path.split(path)[0], exist_ok=True)
+                        transforms.ToPILImage()(grid).save(path)
+
+
+    def on_train_epoch_end(self, trainer: Trainer, pl_module: pl.LightningModule) -> None:
+        if not self.disabled and (pl_module.current_epoch % self.epoch_frequency == 0):
+            self.log_views(pl_module, pl_module.current_epoch)
 
 
 class ImageLogger(Callback):
