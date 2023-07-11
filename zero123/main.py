@@ -216,20 +216,21 @@ class SetupCallback(Callback):
 
 class TestImagesLogger(Callback):
     def __init__(self, test_images_dir, view_angles, epoch_frequency=5, image_size=256,
-                 cfg_scales=[3.0], view_names=[], batch_size=-1, disabled=False) -> None:
+                 cfg_scales=[3.0], batch_size=-1, log_local=True, log_wandb=True, log_first_step=True) -> None:
         super().__init__()
         self.test_images_dir = test_images_dir
-        self.view_angles = view_angles
-        self.view_names = view_names if view_names else [str(v) for v in view_angles]
-        assert len(self.view_names) == len(self.view_angles)
+        self.view_xyz = [(v['x'], v['y'], v['z']) for v in view_angles]
+        self.view_names = [v['name'] for v in view_angles]
         self.image_size = image_size
         self.epoch_frequency = epoch_frequency
         self.cfg_scales = cfg_scales
-        self.cfg_scale_names = [f'cfg_scale_{s}' for s in cfg_scales]
-        if not 1.0 in cfg_scales:
+        if 1.0 not in cfg_scales:
             self.cfg_scales.append(1.0)
         self.cfg_scales = sorted(self.cfg_scales)
-        self.disabled = disabled
+        self.cfg_scale_names = [f'cfg_scale_{s}' for s in self.cfg_scales]
+        self.log_local = log_local
+        self.log_wandb = log_wandb
+        self.log_first_step = log_first_step
         image_transforms = [transforms.Resize(self.image_size),
                             transforms.ToTensor(),
                             transforms.Lambda(lambda x: x * 2. - 1.)]
@@ -259,7 +260,7 @@ class TestImagesLogger(Callback):
         imgs_grid = torchvision.utils.make_grid(image_batch.view(-1, 3, imsize, imsize), nrow=len(col_names), padding=0)
 
         full_grid = torch.ones(3, imsize * (len(row_names) + 1), imsize * (len(col_names) + 1))
-        full_grid[:, imsize:, imsize:] = image_original
+        full_grid[:, :imsize, :imsize] = image_original
         full_grid[:, imsize:, imsize:] = imgs_grid
 
         for i, row_name in enumerate(row_names):
@@ -273,14 +274,17 @@ class TestImagesLogger(Callback):
     def log_views(self, pl_module, epoch_number, label="challenges"):
         local_root = os.path.join(pl_module.logger.save_dir, label)
         os.makedirs(local_root, exist_ok=True)
-        if (epoch_number % self.epoch_frequency == 0) and hasattr(pl_module, "log_novel_view") and callable(
-                pl_module.log_novel_view):
+        if hasattr(pl_module, "log_novel_views") and callable(pl_module.log_novel_views):
+            rank_zero_print("====== RUNNING TEST IMAGES VIEWS SAMPLING ======")
             for i, img_batch in enumerate(self.loader):
                 names = self.names[i*self.batch_size : (i+1)*self.batch_size]
                 novel_views = pl_module.log_novel_views(
-                    img_batch, self.view_angles, names=names, scales=self.cfg_scales)
+                    img_batch[0], self.view_xyz, scales=self.cfg_scales)
                 grids = [self._create_image_grid(
-                    novel_views[img_num], img_batch[img_num], self.view_names, self.cfg_scale_names) for img_num in range(len(img_batch))]
+                    novel_views[img_num],
+                    torch.clamp((img_batch[0][img_num] + 1.0) / 2.0, min=0.0, max=1.0),
+                    self.view_names,
+                    self.cfg_scale_names) for img_num in range(img_batch[0].shape[0])]
                 
                 for name, grid in zip(names, grids):
                     if self.log_wandb:
@@ -292,9 +296,13 @@ class TestImagesLogger(Callback):
                         transforms.ToPILImage()(grid).save(path)
 
 
-    def on_train_epoch_end(self, trainer: Trainer, pl_module: pl.LightningModule) -> None:
-        if not self.disabled and (pl_module.current_epoch % self.epoch_frequency == 0):
+    def on_train_epoch_start(self, trainer: Trainer, pl_module: pl.LightningModule) -> None:
+        if pl_module.current_epoch % self.epoch_frequency == 0:
             self.log_views(pl_module, pl_module.current_epoch)
+
+    # def on_fit_start(self, trainer: Trainer, pl_module: pl.LightningModule) -> None:
+    #     if self.log_first_step:
+    #         self.log_views(pl_module, pl_module.current_epoch)
 
 
 class ImageLogger(Callback):
