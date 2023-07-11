@@ -26,7 +26,7 @@ import io
 import tarfile
 import math
 import re
-from safetensors.torch import load as load_sftr
+from safetensors.torch import load as load_sftr, load_file as load_sftr_file
 from torch.utils.data.distributed import DistributedSampler
 
 # Some hacky things to make experimentation easier
@@ -240,7 +240,6 @@ class ExtendedObjaverseDataModuleFromConfig(pl.LightningDataModule):
     def train_dataloader(self):
         datasets = [ExtendedObjaverseData(
             root_dir=dataset_params.root_dir,
-            meta_dir=dataset_params.meta_dir if 'meta_dir' in dataset_params else None,
             data_config_file=dataset_params.data_config_file,
             load_tensors=self.load_tensors,
             total_view=self.total_view,
@@ -253,7 +252,6 @@ class ExtendedObjaverseDataModuleFromConfig(pl.LightningDataModule):
     def val_dataloader(self):
         datasets = [ExtendedObjaverseData(
             root_dir=dataset_params.root_dir,
-            meta_dir=dataset_params.meta_dir if 'meta_dir' in dataset_params else None,
             data_config_file=dataset_params.data_config_file,
             load_tensors=self.load_tensors,
             total_view=self.total_view,
@@ -266,7 +264,6 @@ class ExtendedObjaverseDataModuleFromConfig(pl.LightningDataModule):
     def test_dataloader(self):
         datasets = [ExtendedObjaverseData(
             root_dir=dataset_params.root_dir,
-            meta_dir=dataset_params.meta_dir if 'meta_dir' in dataset_params else None,
             data_config_file=dataset_params.data_config_file,
             total_view=self.total_view,
             load_tensors=self.load_tensors,
@@ -278,7 +275,6 @@ class ExtendedObjaverseDataModuleFromConfig(pl.LightningDataModule):
 class ExtendedObjaverseData(Dataset):
     def __init__(self,
         root_dir='.objaverse/hf-objaverse-v1/views',
-        meta_dir=None,
         data_config_file=None,
         load_tensors=False,
         image_transforms=[],
@@ -300,8 +296,6 @@ class ExtendedObjaverseData(Dataset):
         self.total_view = total_view
         self.load_tensors = load_tensors
 
-        self.meta_dir = meta_dir if meta_dir else root_dir
-
         data_config_path = data_config_file if data_config_file else os.path.join(root_dir, 'valid_paths.json')
         with open(data_config_path) as f:
             self.paths = json.load(f)
@@ -317,29 +311,47 @@ class ExtendedObjaverseData(Dataset):
     def __len__(self):
         return len(self.paths)
 
-    def load_img(self, tar, tar_name, index, fname_format_str='rgba/rgba_{view_index:04d}.png'):
-        image = tar.extractfile(f'{tar_name}/{fname_format_str.format(view_index=index)}').read()
-        image = Image.open(io.BytesIO(image)).convert('RGBA')
+    def load_img(self, object_storage, index, fname_format_str='rgba/rgba_{view_index:04d}.png'):
+        img_fname = f'{fname_format_str.format(view_index=index)}'
+        if isinstance(object_storage, tarfile.TarFile):
+            object_name = object_storage.getnames()[0]
+            image = object_storage.extractfile(f'{object_name}/{img_fname}').read()
+            image = Image.open(io.BytesIO(image)).convert('RGBA')
+        else:
+            image = Image.open(os.path.join(object_storage, img_fname)).convert('RGBA')
         return image
     
-    def load_tensor(self, tar, tar_name, index, color_index=0, fname_format_str='view-{view_index:03d}-c{color_index:02d}.sftr', key='vae_latent'):
-        tensor = tar.extractfile(f'{tar_name}/{fname_format_str.format(view_index=index, color_index=color_index)}').read()
-        return load_sftr(tensor)[key]
+    def load_tensor(self, object_storage, index, color_index=0,
+                             fname_format_str='view-{view_index:03d}-c{color_index:02d}.sftr', key='vae_latent'):
+        tensor_fname = f'{fname_format_str.format(view_index=index, color_index=color_index)}'
+        if isinstance(object_storage, tarfile.TarFile):
+            object_name = object_storage.getnames()[0]
+            tensor = object_storage.extractfile(f'{object_name}/{tensor_fname}').read()
+            tensor = load_sftr(tensor)[key]
+        else:
+            tensor = load_sftr_file(os.path.join(object_storage, tensor_fname))[key]
+        return tensor
+
+    def load_viewpoint(self, object_storage, index, prefix='frame_'):
+        metas_fname = f'{prefix}{index:04d}.json'
+        if isinstance(object_storage, tarfile.TarFile):
+            object_name = object_storage.getnames()[0]
+            metas = object_storage.extractfile(f'{object_name}/{metas_fname}').read()
+            metas = json.loads(metas)
+        else:
+            with open(os.path.join(object_storage, metas_fname), 'r') as f:
+                metas = json.loads(f.read())
+        polar, azimuth, r = metas["polar"], metas["azimuth"], metas["r"]
+        return polar, azimuth, r
 
     def process_img(self, img, background_color=(255, 255, 255)):
         background = Image.new('RGBA', img.size, background_color)
         img = Image.alpha_composite(background, img).convert("RGB")
         return self.tform(img) if self.tform else img
 
-    def load_viewpoint(self, tar, tar_name, index, prefix='frame_'):
-        metas = tar.extractfile(f'{tar_name}/{prefix}{index:04d}.json').read()
-        metas = json.loads(metas)
-        polar, azimuth, r = metas["polar"], metas["azimuth"], metas["r"]
-        return polar, azimuth, r
-
-    def get_T(self, tar, tar_name, index_target, index_cond):
-        target_polar, target_azimuth, target_r = self.load_viewpoint(tar, tar_name, index_target)
-        cond_polar, cond_azimuth, cond_r = self.load_viewpoint(tar, tar_name, index_cond)
+    def get_T(self, object_storage, index_target, index_cond):
+        target_polar, target_azimuth, target_r = self.load_viewpoint(object_storage, index_target)
+        cond_polar, cond_azimuth, cond_r = self.load_viewpoint(object_storage, index_cond)
         
         d_polar = target_polar - cond_polar
         d_azimuth = (target_azimuth - cond_azimuth) % (2 * math.pi)
@@ -348,60 +360,63 @@ class ExtendedObjaverseData(Dataset):
         d_T = torch.tensor([d_polar, math.sin(d_azimuth), math.cos(d_azimuth), d_r])
         return d_T
 
-    def extract_data(self, tar, metas_tar, tar_name, index_target, index_cond):
+    def extract_data(self, object_storage, index_target, index_cond):
         data = {}
         if not self.load_tensors:
-            data["image_target"] = self.process_img(self.load_img(tar, tar_name, index_target))
-            data["image_cond"] = self.process_img(self.load_img(tar, tar_name, index_cond))
+            data["image_target"] = self.process_img(self.load_img(object_storage, index_target))
+            data["image_cond"] = self.process_img(self.load_img(object_storage, index_cond))
         else:
-            data["latent_target"] = self.load_tensor(tar, tar_name, index_target)
-            data["latent_cond"] = self.load_tensor(tar, tar_name, index_cond)
+            data["latent_target"] = self.load_tensor(object_storage, index_target)
+            data["latent_cond"] = self.load_tensor(object_storage, index_cond)
             data["clip_emb_cond"] = self.load_tensor(
-                tar, tar_name, index_cond,
+                object_storage, index_cond,
                 fname_format_str='clip-{view_index:03d}-c{color_index:02d}.sftr',
                 key='clip_emb')
-        data["T"] = self.get_T(metas_tar, tar_name, index_target, index_cond)
+        data["T"] = self.get_T(object_storage, index_target, index_cond)
 
         return data
 
     def __getitem__(self, index):
         data = {}
         # TODO: set seed
-        tar_filename = os.path.join(self.root_dir, self.paths[index])
-        tar_name = Path(tar_filename).stem
-        tar = tarfile.open(tar_filename)
-        metas_tar = tar if self.root_dir == self.meta_dir else tarfile.open(os.path.join(self.meta_dir, self.paths[index]))
+        object_filepath = os.path.join(self.root_dir, self.paths[index])
+        is_tar = False
+        if object_filepath.endswith('.tar'):
+            is_tar = True
+        object_name = Path(object_filepath).stem
         if self.return_paths:
-            data["path"] = str(tar_filename)
+            data["path"] = str(object_filepath)
+
+        object_storage = tarfile.open(object_filepath) if is_tar else object_filepath
         
         total_view = self.total_view
-        tar_files = tar.getnames()
+        object_files = object_storage.getnames() if is_tar else os.listdir(object_storage)
         if self.load_tensors:
-            total_view = len([f for f in tar_files if re.findall(r'view-(\d+)-c00.sftr', f)])
-            total_view = min(total_view, len([f for f in tar_files if re.findall(r'clip-(\d+)-c00.sftr', f)]))
+            total_view = len([f for f in object_files if re.findall(r'view-(\d+)-c00.sftr', f)])
+            total_view = min(total_view, len([f for f in object_files if re.findall(r'clip-(\d+)-c00.sftr', f)]))
         else:
-            total_view = len([f for f in tar_files if re.findall(r'rgba/rgba_(\d+).png', f)])
+            total_view = len([f for f in object_files if re.findall(r'rgba/rgba_(\d+).png', f)])
 
         # TODO: remove
         if total_view < 48:
-            print(f"==== Invalid object {tar_name} ====")
+            print(f"==== Invalid object {object_name} ====")
             return self.__getitem__((index + 1) % len(self.paths))
 
         try:
             index_target, index_cond = random.sample(range(total_view-1), 2) # without replacement
             # index_target, index_cond = 2, 1
-            data = self.extract_data(tar, metas_tar, tar_name, index_target, index_cond)
+            data = self.extract_data(object_storage, index_target, index_cond)
         except KeyboardInterrupt:
             raise
         except:
-            print(f"************* Invalid files {tar_filename} {index_target} {index_cond} ***************")
+            print(f"************* Invalid files {object_filepath} {index_target} {index_cond} ***************")
             with open("/fsx/proj-mod3d/dmitry/repos/zero123/zero123/invalid_files.txt", "a") as f:
-                f.write(f'{tar_filename}:({index_target}, {index_cond})\n')
+                f.write(f'{object_filepath}:({index_target}, {index_cond})\n')
             index_target, index_cond = 1, 2
-            data = self.extract_data(tar, metas_tar, tar_name, index_target, index_cond)
+            data = self.extract_data(object_storage, index_target, index_cond)
             return self.__getitem__((index + 1) % len(self.paths))
 
-        # data['tar_name'] = tar_name
+        # data['object_name'] = object_name
 
         if self.postprocess is not None:
             data = self.postprocess(data)
