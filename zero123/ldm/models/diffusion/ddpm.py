@@ -486,6 +486,8 @@ class LatentDiffusion(DDPM):
     def __init__(self,
                  first_stage_config,
                  cond_stage_config,
+                 first_stage_precomputed=False,
+                 cond_stage_precomputed=False,
                  num_timesteps_cond=None,
                  cond_stage_key="image",
                  cond_stage_embedding_key=None,
@@ -497,6 +499,10 @@ class LatentDiffusion(DDPM):
                  scale_by_std=False,
                  unet_trainable=True,
                  *args, **kwargs):
+        self.first_stage_config = first_stage_config
+        self.first_stage_precomputed = first_stage_precomputed
+        self.cond_stage_config = cond_stage_config
+        self.cond_stage_precomputed = cond_stage_precomputed
         self.num_timesteps_cond = default(num_timesteps_cond, 1)
         self.scale_by_std = scale_by_std
         assert self.num_timesteps_cond <= kwargs['timesteps']
@@ -521,8 +527,8 @@ class LatentDiffusion(DDPM):
             self.scale_factor = scale_factor
         else:
             self.register_buffer('scale_factor', torch.tensor(scale_factor))
-        self.instantiate_first_stage(first_stage_config)
-        self.instantiate_cond_stage(cond_stage_config)
+        self.instantiate_first_stage()
+        self.instantiate_cond_stage()
         # assert not self.cond_stage_precomputed or cond_stage_embedding_key
         self.cond_stage_forward = cond_stage_forward
 
@@ -571,44 +577,48 @@ class LatentDiffusion(DDPM):
         if self.shorten_cond_schedule:
             self.make_cond_schedule()
 
-    def instantiate_first_stage(self, config):
+    def instantiate_first_stage(self, instantiate_anyway=False):
+        assert not (self.first_stage_config == "__is_identity__" and instantiate_anyway)
         self.first_stage_precomputed = False
-        if config == "__is_identity__":
+        if self.first_stage_config == "__is_identity__" or self.first_stage_precomputed and not instantiate_anyway:
             print("Using identity as first stage.")
             self.first_stage_precomputed = True
             self.first_stage_model = None
             return
-        model = instantiate_from_config(config)
+        model = instantiate_from_config(self.first_stage_config)
         self.first_stage_model = model.eval()
         self.first_stage_model.train = disabled_train
-        for param in self.first_stage_model.parameters():
-            param.requires_grad = False
+        if not self.first_stage_precomputed:
+            for param in self.first_stage_model.parameters():
+                param.requires_grad = False
 
-    def instantiate_cond_stage(self, config):
+    def instantiate_cond_stage(self, instantiate_anyway=False):
+        assert not (self.cond_stage_config == "__is_identity__" and instantiate_anyway)
         self.cond_stage_precomputed = False
         if not self.cond_stage_trainable:
-            if config == "__is_first_stage__":
+            if self.cond_stage_config == "__is_first_stage__":
                 print("Using first stage also as cond stage.")
                 self.cond_stage_model = self.first_stage_model
-            elif config == "__is_unconditional__":
+            elif self.cond_stage_config == "__is_unconditional__":
                 print(f"Training {self.__class__.__name__} as an unconditional model.")
                 self.cond_stage_model = None
                 # self.be_unconditional = True
-            elif config == "__is_identity__":
+            elif self.cond_stage_config == "__is_identity__" or self.cond_stage_precomputed and not instantiate_anyway:
                 print("Using identity as cond stage.")
                 self.cond_stage_precomputed = True
                 self.cond_stage_model = None
             else:
-                model = instantiate_from_config(config)
+                model = instantiate_from_config(self.cond_stage_config)
                 self.cond_stage_model = model.eval()
                 self.cond_stage_model.train = disabled_train
-                for param in self.cond_stage_model.parameters():
-                    param.requires_grad = False
+                if not self.cond_stage_precomputed:
+                    for param in self.cond_stage_model.parameters():
+                        param.requires_grad = False
         else:
-            assert config != '__is_first_stage__'
-            assert config != '__is_unconditional__'
-            assert config != '__is_identity__'
-            model = instantiate_from_config(config)
+            assert self.cond_stage_config != '__is_first_stage__'
+            assert self.cond_stage_config != '__is_unconditional__'
+            assert self.cond_stage_config != '__is_identity__'
+            model = instantiate_from_config(self.cond_stage_config)
             self.cond_stage_model = model
 
     def _get_denoise_row_from_list(self, samples, desc='', force_no_decoder_quantization=False):
@@ -1355,7 +1365,7 @@ class LatentDiffusion(DDPM):
             
             T = torch.tensor([math.radians(x), math.sin(
                 math.radians(y)), math.cos(math.radians(y)), z])
-            T = T[None, None, :].repeat(n_samples, 1, 1).to(c.device)
+            T = T[None, None, :].repeat(n_samples, 1, 1).to(cond_emb.device)
             c = torch.cat([cond_emb, T], dim=-1)
             c = self.cc_projection(c)
             cond = {}
@@ -1363,12 +1373,12 @@ class LatentDiffusion(DDPM):
             cond['c_concat'] = [cond_latent]
             if scale != 1.0:
                 uc = {}
-                uc['c_concat'] = [torch.zeros(n_samples, 4, self.image_size // 8, self.image_size // 8).to(c.device)]
+                uc['c_concat'] = [torch.zeros_like(cond_latent).to(c.device)]
                 uc['c_crossattn'] = [torch.zeros_like(c).to(c.device)]
             else:
                 uc = None
 
-            shape = [4, self.image_size // 8, self.image_size // 8]
+            shape = list(cond_latent.shape)[1:]
             samples_ddim, _ = sampler.sample(S=ddim_steps,
                                             conditioning=cond,
                                             batch_size=n_samples,
@@ -1384,18 +1394,27 @@ class LatentDiffusion(DDPM):
             return torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0).cpu()
 
     @torch.no_grad()
-    def log_novel_views(self, imgs, view_angles, names, scales=[3.0]):
+    def log_novel_views(self, imgs, view_angles, scales=[3.0]):
         num_samples = imgs.shape[0]
-        assert num_samples == len(names)
         imgs = imgs.to(self.device)
-        n_samples = imgs.shape[0]
-        cond_emb = self.get_learned_conditioning(imgs).tile(n_samples, 1, 1)
-        cond_latent = self.encode_first_stage((imgs)).mode().detach().repeat(n_samples, 1, 1, 1)
-        log_batch = torch.empty((num_samples, len(scales), len(view_angles), 3, self.image_size, self.image_size)).to(self.device)
+
+        if self.first_stage_precomputed and self.first_stage_model is None:
+            self.instantiate_first_stage(instantiate_anyway=True)
+        cond_latent = self.encode_first_stage((imgs)).mode().detach()
+        if self.cond_stage_precomputed and self.cond_stage_model is None:
+            self.instantiate_cond_stage(instantiate_anyway=True)
+        cond_emb = self.get_learned_conditioning(imgs)
+        
+        log_batch = torch.empty((num_samples, len(scales), len(view_angles), 3, imgs.shape[-2], imgs.shape[-1])).to(self.device)
         for n_view, (x, y, z) in enumerate(view_angles):
             for n_scale, scale in enumerate(scales):
-                samples = self.sample_novel_views(cond_emb, cond_latent, x, y, z, scale=scale)
+                samples = self.sample_novel_view(cond_emb, cond_latent, x, y, z, scale=scale)
                 log_batch[:, n_scale, n_view, ...] = samples
+
+        del self.first_stage_model
+        del self.cond_stage_model
+        self.first_stage_model = None
+        self.cond_stage_model = None
         return log_batch
 
     @torch.no_grad()
