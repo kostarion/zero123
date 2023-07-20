@@ -579,22 +579,20 @@ class LatentDiffusion(DDPM):
 
     def instantiate_first_stage(self, instantiate_anyway=False):
         assert not (self.first_stage_config == "__is_identity__" and instantiate_anyway)
-        self.first_stage_precomputed = False
         if self.first_stage_config == "__is_identity__" or self.first_stage_precomputed and not instantiate_anyway:
             print("Using identity as first stage.")
             self.first_stage_precomputed = True
             self.first_stage_model = None
             return
         model = instantiate_from_config(self.first_stage_config)
-        self.first_stage_model = model.eval()
+        self.first_stage_model = model.eval().to(self.device)
         self.first_stage_model.train = disabled_train
-        if not self.first_stage_precomputed:
-            for param in self.first_stage_model.parameters():
-                param.requires_grad = False
+        # if not self.first_stage_precomputed:
+        for param in self.first_stage_model.parameters():
+            param.requires_grad = False
 
     def instantiate_cond_stage(self, instantiate_anyway=False):
         assert not (self.cond_stage_config == "__is_identity__" and instantiate_anyway)
-        self.cond_stage_precomputed = False
         if not self.cond_stage_trainable:
             if self.cond_stage_config == "__is_first_stage__":
                 print("Using first stage also as cond stage.")
@@ -609,11 +607,11 @@ class LatentDiffusion(DDPM):
                 self.cond_stage_model = None
             else:
                 model = instantiate_from_config(self.cond_stage_config)
-                self.cond_stage_model = model.eval()
+                self.cond_stage_model = model.eval().to(self.device)
                 self.cond_stage_model.train = disabled_train
-                if not self.cond_stage_precomputed:
-                    for param in self.cond_stage_model.parameters():
-                        param.requires_grad = False
+                # if not self.cond_stage_precomputed:
+                for param in self.cond_stage_model.parameters():
+                    param.requires_grad = False
         else:
             assert self.cond_stage_config != '__is_first_stage__'
             assert self.cond_stage_config != '__is_unconditional__'
@@ -1356,6 +1354,46 @@ class LatentDiffusion(DDPM):
         cond["c_crossattn"] = [c]
         cond["c_concat"] = [torch.zeros([batch_size, 4, image_size // 8, image_size // 8]).to(self.device)]
         return cond
+    
+    @torch.no_grad()
+    def sample_novel_views(self, imgs, T, scales=[3.0], ddim_steps=200, ddim_eta=1.0):
+        cond_latent = self.encode_first_stage((imgs)).mode().detach()
+        cond_emb = self.get_learned_conditioning(imgs).detach()
+        
+        sampler = DDIMSampler(self)
+        res = []
+        with self.ema_scope():
+            T = T.unsqueeze(1).to(self.device)
+            c = torch.cat([cond_emb, T], dim=-1)
+            c = self.cc_projection(c)
+            cond = {}
+            cond['c_crossattn'] = [c]
+            cond['c_concat'] = [cond_latent]
+
+            for scale in scales:
+                if scale != 1.0:
+                    uc = {}
+                    uc['c_concat'] = [torch.zeros_like(cond_latent).to(c.device)]
+                    uc['c_crossattn'] = [torch.zeros_like(c).to(c.device)]
+                else:
+                    uc = None
+
+                shape = list(cond_latent.shape)[1:]
+                samples_ddim, _ = sampler.sample(S=ddim_steps,
+                                                conditioning=cond,
+                                                batch_size=imgs.shape[0],
+                                                shape=shape,
+                                                verbose=False,
+                                                unconditional_guidance_scale=scale,
+                                                unconditional_conditioning=uc,
+                                                eta=ddim_eta,
+                                                x_T=None)
+                # print(samples_ddim.shape)
+                # samples_ddim = torch.nn.functional.interpolate(samples_ddim, 64, mode='nearest', antialias=False)
+                x_samples_ddim = self.decode_first_stage(samples_ddim)
+                # batch_size x 3 x imsize x imsize
+                res.append(torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0).detach().cpu())
+        return torch.stack(res).movedim(0, 1)
 
     @torch.no_grad()
     def sample_novel_view(self, cond_emb, cond_latent, x, y, z, ddim_steps=200, scale=3.0, ddim_eta=1.0):
@@ -1404,17 +1442,20 @@ class LatentDiffusion(DDPM):
         if self.cond_stage_precomputed and self.cond_stage_model is None:
             self.instantiate_cond_stage(instantiate_anyway=True)
         cond_emb = self.get_learned_conditioning(imgs)
-        
+
         log_batch = torch.empty((num_samples, len(scales), len(view_angles), 3, imgs.shape[-2], imgs.shape[-1])).to(self.device)
         for n_view, (x, y, z) in enumerate(view_angles):
             for n_scale, scale in enumerate(scales):
                 samples = self.sample_novel_view(cond_emb, cond_latent, x, y, z, scale=scale)
                 log_batch[:, n_scale, n_view, ...] = samples
 
-        del self.first_stage_model
-        del self.cond_stage_model
-        self.first_stage_model = None
-        self.cond_stage_model = None
+        if self.first_stage_precomputed:
+            del self.first_stage_model
+            self.first_stage_model = None
+        if self.cond_stage_precomputed:
+            del self.cond_stage_model
+            self.cond_stage_model = None
+        torch.cuda.empty_cache()
         return log_batch
 
     @torch.no_grad()
