@@ -7,6 +7,7 @@ from torchvision import transforms, datasets
 import pytorch_lightning as pl
 import copy
 import wandb
+import warnings
 
 from packaging import version
 from omegaconf import OmegaConf
@@ -174,7 +175,7 @@ class SetupCallback(Callback):
         self.debug = debug
 
     def on_keyboard_interrupt(self, trainer, pl_module):
-        if not self.debug and trainer.global_rank == 0:
+        if not self.debug and trainer.global_rank == 0 and trainer.global_step != 0:
             rank_zero_print("Summoning checkpoint.")
             ckpt_path = os.path.join(self.ckptdir, "last.ckpt")
             trainer.save_checkpoint(ckpt_path)
@@ -219,7 +220,7 @@ class TestImagesLogger(Callback):
                  cfg_scales=[3.0], batch_size=-1, log_local=True, log_wandb=True, log_first_step=True) -> None:
         super().__init__()
         self.test_images_dir = test_images_dir
-        self.view_xyz = [(v['x'], v['y'], v['z']) for v in view_angles]
+        self.views_xyz = [(v['x'], v['y'], v['z']) for v in view_angles]
         self.view_names = [v['name'] for v in view_angles]
         self.image_size = image_size
         self.epoch_frequency = epoch_frequency
@@ -247,8 +248,10 @@ class TestImagesLogger(Callback):
         img = Image.new('RGB', (width, height), color = 'white')
         draw = ImageDraw.Draw(img)
         font = ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf', font_size)
-        # font = ImageFont.load_default(font_size=font_size)
-        text_width, text_height = draw.textsize(text, font=font)
+        # font = ImageFont.load_default()
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=DeprecationWarning)
+            text_width, text_height = draw.textsize(text, font=font)
         x = (width - text_width) / 2
         y = (height - text_height) / 2
         # draw the text on the image
@@ -274,12 +277,13 @@ class TestImagesLogger(Callback):
     def log_views(self, pl_module, epoch_number, label="challenges"):
         local_root = os.path.join(pl_module.logger.save_dir, label)
         os.makedirs(local_root, exist_ok=True)
-        if hasattr(pl_module, "log_novel_views") and callable(pl_module.log_novel_views):
+        # FIX!!! pl_module.device.index == 0 and 
+        if pl_module.device.index == 0 and hasattr(pl_module, "log_novel_views") and callable(pl_module.log_novel_views):
             rank_zero_print("====== RUNNING TEST IMAGES VIEWS SAMPLING ======")
             for i, img_batch in enumerate(self.loader):
                 names = self.names[i*self.batch_size : (i+1)*self.batch_size]
                 novel_views = pl_module.log_novel_views(
-                    img_batch[0], self.view_xyz, scales=self.cfg_scales)
+                    img_batch[0], self.views_xyz, scales=self.cfg_scales)
                 grids = [self._create_image_grid(
                     novel_views[img_num],
                     torch.clamp((img_batch[0][img_num] + 1.0) / 2.0, min=0.0, max=1.0),
@@ -288,9 +292,9 @@ class TestImagesLogger(Callback):
                 
                 for name, grid in zip(names, grids):
                     if self.log_wandb:
-                        pl_module.logger.experiment.log({f'challenges/{name}': grid}, step=pl_module.global_step)
+                        pl_module.logger.experiment.log({f'challenges/{name}': wandb.Image(grid)}, step=pl_module.global_step)
                     if self.log_local:
-                        filename = f"{name}_gs-{pl_module.global_step:06d}_e-{pl_module.current_epoch:06}.png"
+                        filename = f"{name}_gs-{pl_module.global_step:06d}_e-{pl_module.current_epoch:06}.jpg"
                         path = os.path.join(local_root, filename)
                         os.makedirs(os.path.split(path)[0], exist_ok=True)
                         transforms.ToPILImage()(grid).save(path)
@@ -676,7 +680,7 @@ if __name__ == "__main__":
                          "filename": "{epoch:06}-{step:09}",
                          "verbose": True,
                          'save_top_k': -1,
-                         'every_n_train_steps': 1000,
+                         'every_n_train_steps': 5000,
                          'save_weights_only': True
                      }
                      }
@@ -747,7 +751,7 @@ if __name__ == "__main__":
         # allow checkpointing via USR1
         def melk(*args, **kwargs):
             # run all checkpoint hooks
-            if trainer.global_rank == 0:
+            if trainer.global_rank == 0 and trainer.global_step != 0:
                 rank_zero_print("Summoning checkpoint.")
                 ckpt_path = os.path.join(ckptdir, "last.ckpt")
                 trainer.save_checkpoint(ckpt_path)
