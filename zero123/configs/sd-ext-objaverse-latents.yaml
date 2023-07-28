@@ -45,33 +45,12 @@ model:
         use_checkpoint: True
         legacy: False
 
-    first_stage_config:
-      target: ldm.models.autoencoder.AutoencoderKL
-      params:
-        embed_dim: 4
-        monitor: val/rec_loss
-        ddconfig:
-          double_z: true
-          z_channels: 4
-          resolution: 256
-          in_channels: 3
-          out_ch: 3
-          ch: 128
-          ch_mult:
-          - 1
-          - 2
-          - 4
-          - 4
-          num_res_blocks: 2
-          attn_resolutions: []
-          dropout: 0.0
-        lossconfig:
-          target: torch.nn.Identity
+    first_stage_config: __is_identity__
 
-    cond_stage_config:
-      target: ldm.modules.encoders.modules.FrozenCLIPImageEmbedder
+    cond_stage_config: __is_identity__
 
 
+# python main.py -t --base configs/sd-ext-objaverse-latents.yaml  --gpus 0,1,2,3,4,5,6,7  --scale_lr False  --num_nodes 1  --seed 43 --check_val_every_n_epoch 5     --finetune_from sd-image-conditioned-v2.ckpt   --logdir /fsx/proj-mod3d/dmitry/zero123logs    --name latents_objaverse_diffcolors
 data:
   target: ldm.data.simple.ExtendedObjaverseDataModuleFromConfig
   params:
@@ -81,6 +60,17 @@ data:
     datasets:
       - root_dir: /scratch/objaverse_untar
         data_config_file: /fsx/proj-mod3d/dmitry/repos/zero123/zero123/good_objaverse_obj_dirs_shard_dirs.json
+        color0_prob: 1.0
+        cond_polar_thr: 180
+        elevation_cond: True
+      # - root_dir: /scratch/humgen_untar
+      #   data_config_file: /fsx/proj-mod3d/dmitry/repos/zero123/zero123/humgen_shard_dirs.json
+      #   color0_prob: 1.0
+      #   cond_polar_thr: 180
+      # - root_dir: /scratch/humgen_heads_untar
+      #   data_config_file: /fsx/proj-mod3d/dmitry/repos/zero123/zero123/humgen_heads_shard_dirs.json
+      #   color0_prob: 1.0
+      #   cond_polar_thr: 180
       # - root_dir: /fsx/proj-mod3d/objaverse-render-latents
       #   data_config_file: /fsx/proj-mod3d/dmitry/repos/zero123/zero123/good_objaverse_render_tars.json
         # meta_dir: /fsx/proj-mod3d/latents/objaverse_atleast2likes/fp16
@@ -101,19 +91,19 @@ lightning:
   metrics_over_trainsteps_checkpoint: True
   modelcheckpoint:
     params:
-      every_n_train_steps: 1000
+      every_n_train_steps: 5000
   callbacks:
-    test_images_logger:
-      target: main.TestImagesLogger
-      params:
-        test_images_dir: /fsx/proj-mod3d/dmitry/repos/hard_examples_preprocessed
-        view_angles:
-          - { name: left, x: 0.0, y: -90.0, z: 0.0 }
-          - { name: right, x: 0.0, y: 90.0, z: 0.0 }
-          - { name: above, x: -89.5, y: 0.0, z: 0.0 }
-          - { name: behind, x: 0.0, y: 180.0, z: 0.0 }
-        epoch_frequency: 2
-        cfg_scales: [3.0, 5.0]
+    # test_images_logger:
+    #   target: main.TestImagesLogger
+    #   params:
+    #     test_images_dir: /fsx/proj-mod3d/dmitry/repos/hard_examples_preprocessed
+    #     view_angles:
+    #       - { name: left, x: 0.0, y: -90.0, z: 0.0 }
+    #       - { name: right, x: 0.0, y: 90.0, z: 0.0 }
+    #       - { name: above, x: -89.5, y: 0.0, z: 0.0 }
+    #       - { name: behind, x: 0.0, y: 180.0, z: 0.0 }
+    #     epoch_frequency: 20
+    #     cfg_scales: [3.0, 5.0]
     image_logger:
       target: main.ImageLogger
       params:
