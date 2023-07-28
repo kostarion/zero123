@@ -243,6 +243,9 @@ class ExtendedObjaverseDataModuleFromConfig(pl.LightningDataModule):
             data_config_file=dataset_params.data_config_file,
             load_tensors=self.load_tensors,
             total_view=self.total_view,
+            color0_prob=dataset_params.color0_prob,
+            cond_polar_thr=dataset_params.cond_polar_thr,
+            elevation_cond=dataset_params.elevation_cond,
             validation=False,
             image_transforms=self.image_transforms) for dataset_params in self.datasets_params]
         dataset = ConcatDataset(datasets)
@@ -255,6 +258,9 @@ class ExtendedObjaverseDataModuleFromConfig(pl.LightningDataModule):
             data_config_file=dataset_params.data_config_file,
             load_tensors=self.load_tensors,
             total_view=self.total_view,
+            color0_prob=dataset_params.color0_prob,
+            cond_polar_thr=dataset_params.cond_polar_thr,
+            elevation_cond=dataset_params.elevation_cond,
             validation=True,
             image_transforms=self.image_transforms) for dataset_params in self.datasets_params]
         dataset = ConcatDataset(datasets)
@@ -267,6 +273,9 @@ class ExtendedObjaverseDataModuleFromConfig(pl.LightningDataModule):
             data_config_file=dataset_params.data_config_file,
             total_view=self.total_view,
             load_tensors=self.load_tensors,
+            color0_prob=dataset_params.color0_prob,
+            cond_polar_thr=dataset_params.cond_polar_thr,
+            elevation_cond=dataset_params.elevation_cond,
             validation=self.validation) for dataset_params in self.datasets_params]
         dataset = ConcatDataset(datasets)
         return wds.WebLoader(dataset, batch_size=self.batch_size, num_workers=self.num_workers, shuffle=False)
@@ -281,6 +290,9 @@ class ExtendedObjaverseData(Dataset):
         postprocess=None,
         return_paths=False,
         total_view=54,
+        color0_prob=0.5,
+        cond_polar_thr=180,
+        elevation_cond=False,
         validation=False,
         ) -> None:
         """Create a dataset from a folder of images.
@@ -294,7 +306,10 @@ class ExtendedObjaverseData(Dataset):
             postprocess = instantiate_from_config(postprocess)
         self.postprocess = postprocess
         self.total_view = total_view
+        self.color0_prob = color0_prob
+        self.cond_polar_thr = cond_polar_thr
         self.load_tensors = load_tensors
+        self.elevation_cond = elevation_cond
 
         data_config_path = data_config_file if data_config_file else os.path.join(root_dir, 'valid_paths.json')
         with open(data_config_path) as f:
@@ -321,9 +336,9 @@ class ExtendedObjaverseData(Dataset):
             image = Image.open(os.path.join(object_storage, img_fname)).convert('RGBA')
         return image
     
-    def load_tensor(self, object_storage, index, color_index=0,
-                             fname_format_str='view-{view_index:03d}-c{color_index:02d}.sftr', key='vae_latent'):
-        tensor_fname = f'{fname_format_str.format(view_index=index, color_index=color_index)}'
+    def load_tensor(self, object_storage, index, color_idx=0,
+                    fname_format_str='view-{view_index:03d}-c{color_idx:02d}.sftr', key='vae_latent'):
+        tensor_fname = f'{fname_format_str.format(view_index=index, color_idx=color_idx)}'
         if isinstance(object_storage, tarfile.TarFile):
             object_name = object_storage.getnames()[0]
             tensor = object_storage.extractfile(f'{object_name}/{tensor_fname}').read()
@@ -357,24 +372,38 @@ class ExtendedObjaverseData(Dataset):
         d_azimuth = (target_azimuth - cond_azimuth) % (2 * math.pi)
         d_r = target_r - cond_r
         
-        d_T = torch.tensor([d_polar, math.sin(d_azimuth), math.cos(d_azimuth), d_r])
+        if self.elevation_cond:
+            d_T = torch.tensor([d_polar, math.sin(d_azimuth), math.cos(d_azimuth), cond_polar])
+        else:
+            d_T = torch.tensor([d_polar, math.sin(d_azimuth), math.cos(d_azimuth), d_r])
         return d_T
 
-    def extract_data(self, object_storage, index_target, index_cond):
+    def extract_data(self, object_storage, index_target, index_cond, color_idx=0):
         data = {}
         if not self.load_tensors:
             data["image_target"] = self.process_img(self.load_img(object_storage, index_target))
             data["image_cond"] = self.process_img(self.load_img(object_storage, index_cond))
         else:
-            data["latent_target"] = self.load_tensor(object_storage, index_target)
-            data["latent_cond"] = self.load_tensor(object_storage, index_cond)
+            data["latent_target"] = self.load_tensor(object_storage, index_target, color_idx=color_idx)
+            data["latent_cond"] = self.load_tensor(object_storage, index_cond, color_idx=color_idx)
             data["clip_emb_cond"] = self.load_tensor(
-                object_storage, index_cond,
-                fname_format_str='clip-{view_index:03d}-c{color_index:02d}.sftr',
+                object_storage, index_cond, color_idx=color_idx,
+                fname_format_str='clip-{view_index:03d}-c{color_idx:02d}.sftr',
                 key='clip_emb')
         data["T"] = self.get_T(object_storage, index_target, index_cond)
 
         return data
+    
+    def get_indices(self, object_storage, total_view):
+        if self.cond_polar_thr > 0:
+            cond_polar_thr_rad = self.cond_polar_thr / 180. * math.pi
+            polars = [(i, self.load_viewpoint(object_storage, i)[0]) for i in range(total_view)]
+            polars = [p for p in polars if p[1] < cond_polar_thr_rad]
+            index_cond = random.choice(polars)[0]
+            index_target = random.choice([i for i in range(total_view-1) if i != index_cond])
+        else:
+            index_target, index_cond = random.sample(range(total_view-1), 2)
+        return index_target, index_cond
 
     def __getitem__(self, index):
         data = {}
@@ -394,6 +423,7 @@ class ExtendedObjaverseData(Dataset):
         if self.load_tensors:
             total_view = len([f for f in object_files if re.findall(r'view-(\d+)-c00.sftr', f)])
             total_view = min(total_view, len([f for f in object_files if re.findall(r'clip-(\d+)-c00.sftr', f)]))
+            total_view = min(total_view, len([f for f in object_files if re.findall(r'frame_(\d+).json', f)]))
         else:
             total_view = len([f for f in object_files if re.findall(r'rgba/rgba_(\d+).png', f)])
 
@@ -402,10 +432,13 @@ class ExtendedObjaverseData(Dataset):
             print(f"==== Invalid object {object_name} ====")
             return self.__getitem__((index + 1) % len(self.paths))
 
+        color_idx = 0 if random.random() < self.color0_prob else 1
+
         try:
-            index_target, index_cond = random.sample(range(total_view-1), 2) # without replacement
+            index_target, index_cond = self.get_indices(object_storage, total_view)
+            # index_target, index_cond = random.sample(range(total_view-1), 2) # without replacement
             # index_target, index_cond = 2, 1
-            data = self.extract_data(object_storage, index_target, index_cond)
+            data = self.extract_data(object_storage, index_target, index_cond, color_idx=color_idx)
         except KeyboardInterrupt:
             raise
         except:
@@ -413,7 +446,7 @@ class ExtendedObjaverseData(Dataset):
             with open("/fsx/proj-mod3d/dmitry/repos/zero123/zero123/invalid_files.txt", "a") as f:
                 f.write(f'{object_filepath}:({index_target}, {index_cond})\n')
             index_target, index_cond = 1, 2
-            data = self.extract_data(object_storage, index_target, index_cond)
+            data = self.extract_data(object_storage, index_target, index_cond, color_idx=color_idx)
             return self.__getitem__((index + 1) % len(self.paths))
 
         # data['object_name'] = object_name
