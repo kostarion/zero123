@@ -816,7 +816,7 @@ class LatentDiffusion(DDPM):
             z_cond = self.encode_first_stage(xc).mode().detach()
         else:
             z = self.get_input_latent(batch, k).to(self.device)
-            z_cond = self.get_input_latent(batch, cond_key).to(self.device)
+            z_cond = self.get_input_latent(batch, cond_key).to(self.device) / self.scale_factor # to match the original zero123 interface
             if bs is not None:
                 z = z[:bs]
                 z_cond = z_cond[:bs]
@@ -1357,7 +1357,8 @@ class LatentDiffusion(DDPM):
     
     @torch.no_grad()
     def sample_novel_views(self, imgs, T, scales=[3.0], ddim_steps=200, ddim_eta=1.0):
-        cond_latent = self.encode_first_stage((imgs)).mode().detach()
+        cond_latent = self.encode_first_stage((imgs)).mode().detach() # * self.scale_factor # TEMPORAL!
+        print(f'Scale factor: {self.scale_factor}')
         cond_emb = self.get_learned_conditioning(imgs).detach()
         
         sampler = DDIMSampler(self)
