@@ -1,0 +1,122 @@
+model:
+  base_learning_rate: 1.0e-04
+  target: ldm.models.diffusion.ddpm.LatentDiffusion
+  params:
+    linear_start: 0.00085
+    linear_end: 0.0120
+    num_timesteps_cond: 1
+    log_every_t: 200
+    timesteps: 1000
+    first_stage_key: "latent_target"
+    first_stage_precomputed: True
+    cond_stage_key: "latent_cond"
+    cond_stage_precomputed: True
+    cond_stage_embedding_key: "clip_emb_cond"
+    image_size: 32
+    channels: 4
+    cond_stage_trainable: false   # Note: different from the one we trained before
+    conditioning_key: hybrid
+    monitor: val/loss_simple_ema
+    scale_factor: 0.18215
+
+    scheduler_config: # 10000 warmup steps
+      target: ldm.lr_scheduler.LambdaLinearScheduler
+      params:
+        warm_up_steps: [ 100 ]
+        cycle_lengths: [ 10000000000000 ] # incredibly large number to prevent corner cases
+        f_start: [ 1.e-6 ]
+        f_max: [ 1. ]
+        f_min: [ 1. ]
+
+    unet_config:
+      target: ldm.modules.diffusionmodules.openaimodel.UNetModel
+      params:
+        image_size: 32 # unused
+        in_channels: 8
+        out_channels: 4
+        model_channels: 320
+        attention_resolutions: [ 4, 2, 1 ]
+        num_res_blocks: 2
+        channel_mult: [ 1, 2, 4, 4 ]
+        num_heads: 8
+        use_spatial_transformer: True
+        transformer_depth: 1
+        context_dim: 768
+        use_checkpoint: True
+        legacy: False
+
+    first_stage_config: __is_identity__
+
+    cond_stage_config: __is_identity__
+
+
+# python main.py -t --base configs/sd-ext-objaverse-latents.yaml  --gpus 0,1,2,3,4,5,6,7  --scale_lr False  --num_nodes 1  --seed 43 --check_val_every_n_epoch 5     --finetune_from sd-image-conditioned-v2.ckpt   --logdir /fsx/proj-mod3d/dmitry/zero123logs    --name latents_objaverse_diffcolors
+data:
+  target: ldm.data.simple.ExtendedObjaverseDataModuleFromConfig
+  params:
+    batch_size: 192
+    num_workers: 16
+    load_tensors: True
+    datasets:
+      - root_dir: /scratch/objaverse_untar
+        # data_config_file: /fsx/proj-mod3d/dmitry/repos/zero123/zero123/good_objaverse_dirs.json
+        # data_config_file: /fsx/proj-mod3d/dmitry/repos/zero123/zero123/good_objaverse_obj_dirs_shard_dirs.json
+        color0_prob: 1.0
+        cond_polar_thr: 180
+        elevation_cond: True
+        repeats: 1
+      # - root_dir: /fsx/proj-mod3d/objaverse-render-latents
+      #   data_config_file: /fsx/proj-mod3d/dmitry/repos/zero123/zero123/good_objaverse_render_tars.json
+        # meta_dir: /fsx/proj-mod3d/latents/objaverse_atleast2likes/fp16
+        # data_config_file: /fsx/proj-mod3d/dmitry/repos/zero123/zero123/valid_paths_objaverse_bigger.json
+      # - root_dir: /fsx/proj-mod3d/rgbapngs/human
+      #   meta_dir: /fsx/proj-mod3d/latents/human/fp16
+      #   data_config_file: /fsx/proj-mod3d/dmitry/repos/zero123/zero123/valid_paths_human.json
+    total_view: 54
+    train:
+      validation: False
+
+    validation:
+      validation: True
+
+
+lightning:
+  find_unused_parameters: false
+  metrics_over_trainsteps_checkpoint: True
+  modelcheckpoint:
+    params:
+      every_n_train_steps: 5000
+  callbacks:
+    # test_images_logger:
+    #   target: main.TestImagesLogger
+    #   params:
+    #     test_images_dir: /fsx/proj-mod3d/dmitry/repos/hard_examples_preprocessed
+    #     view_angles:
+    #       - { name: left, x: 0.0, y: -90.0, z: 0.0 }
+    #       - { name: right, x: 0.0, y: 90.0, z: 0.0 }
+    #       - { name: above, x: -89.5, y: 0.0, z: 0.0 }
+    #       - { name: behind, x: 0.0, y: 180.0, z: 0.0 }
+    #     epoch_frequency: 20
+    #     cfg_scales: [3.0, 5.0]
+    image_logger:
+      target: main.ImageLogger
+      params:
+        batch_frequency: 500
+        max_images: 0 # 32
+        increase_log_steps: False
+        log_first_step: True
+        log_images_kwargs:
+          use_ema_scope: False
+          inpaint: False
+          plot_progressive_rows: False
+          plot_diffusion_rows: False
+          N: 32
+          unconditional_guidance_scale: 3.0
+          unconditional_guidance_label: [""]
+
+  trainer:
+    max_steps: 250000
+    benchmark: True
+    val_check_interval: 5000000 # really sorry
+    num_sanity_val_steps: 0
+    accumulate_grad_batches: 1
