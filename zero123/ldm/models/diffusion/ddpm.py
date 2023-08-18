@@ -745,7 +745,7 @@ class LatentDiffusion(DDPM):
 
     def get_input_latent(self, batch, k):
         x = batch[k]
-        assert len(x.shape) == 4 and x.shape[1:] == (4, 32, 32)
+        assert len(x.shape) == 4 and x.shape[1:] == (4, self.image_size, self.image_size)
         # x = rearrange(x, 'b h w c -> b c h w')
         x = x.to(memory_format=torch.contiguous_format).float()
         return x
