@@ -13,10 +13,47 @@ from torchvision import transforms
 from torchvision.utils import make_grid
 from torch.utils.data import Dataset, DataLoader
 
+
+TESTSET_ELEVATIONS = {
+    'alien1': 5,
+    'anya': 5,
+    'beach_house': 50,
+    'beetle': 5,
+    'boy2': 5,
+    'castle2': 20,
+    'dad3': 5,
+    'dancer1': 10,
+    'dinoskeleton2': -5,
+    'dodo1': 0,
+    'dog1': 10,
+    'dragon2': 10,
+    'forest_temple': -10,
+    'futuristic_car': 15,
+    'girl2': 5,
+    'globe1': 0,
+    'grootplant': 0,
+    'hamburger': 5,
+    'horse': 5,
+    'modern_house': 15,
+    'mona_lisa': 5,
+    'nendoroid_obama1': 5,
+    'phoenix': 15,
+    'retriever9': 10,
+    'robot': 15,
+    'sadhu1': 10,
+    'turtle': 10,
+    'w1': 5,
+    'w5': 10,
+    'woman': 5,
+    'worker1': 5
+}
+
+
 def filter_checkpoints(dir_ckpt):
     for i, ckpt_name in enumerate(sorted(os.listdir(dir_ckpt))):
         step_num = int(ckpt_name[18:27]) + 1
         if step_num % 5000 == 0 and step_num % 10000 != 0 or step_num == 8000:
+        # if step_num % 60000 == 0 and step_num % 120000 != 0 or step_num == 8000:
             print(f'Leaving {step_num}')
             continue
         os.remove(os.path.join(dir_ckpt, ckpt_name))
@@ -88,6 +125,7 @@ class ImageViewsDataset(Dataset):
         views,
         cfg_scales,
         img_size=256,
+        elev_cond=False,
         preprocess=False,
     ) -> None:
         self.img_dir = img_dir
@@ -97,6 +135,7 @@ class ImageViewsDataset(Dataset):
         self.views = views
         self.cfg_scales = cfg_scales
         self.img_size = img_size
+        self.elev_cond = elev_cond
         image_transforms = [transforms.Resize(img_size)]
         image_transforms.extend([transforms.ToTensor(),
                                 transforms.Lambda(lambda x: x * 2. - 1.)])
@@ -107,7 +146,7 @@ class ImageViewsDataset(Dataset):
             self.preprocess_imgs()
 
     def preprocess_imgs(self):
-        preprocessed_imgs_dir = os.path.join(img_dir, 'preprocessed')
+        preprocessed_imgs_dir = os.path.join(self.img_dir, 'preprocessed')
         print("Preprocessing images in ", self.img_dir, " to ", preprocessed_imgs_dir)
         if not os.path.exists(preprocessed_imgs_dir):
             os.mkdir(preprocessed_imgs_dir)
@@ -128,10 +167,19 @@ class ImageViewsDataset(Dataset):
         img_path = self.img_paths[idx // len(self.views)]
         img_name = os.path.basename(img_path).split('.')[0]
         view = self.views[idx % len(self.views)]
-        T = torch.tensor([math.radians(view['polar']),
+        polar_shift_value = math.radians(
+            max(view['polar'], TESTSET_ELEVATIONS[img_name] - 90) \
+            if self.elev_cond and img_name in TESTSET_ELEVATIONS \
+            else view['polar'])
+        last_cond_value = 0 \
+            if not self.elev_cond \
+            else (math.radians(90 - TESTSET_ELEVATIONS[img_name]) \
+                if img_name in TESTSET_ELEVATIONS \
+                else math.pi / 2)
+        T = torch.tensor([polar_shift_value,
                           math.sin(math.radians(view['azimuth'])),
                           math.cos(math.radians(view['azimuth'])),
-                          view['r']])
+                          last_cond_value])
         img = Image.open(os.path.join(self.img_dir, img_path)).convert("RGBA")
         background = Image.new('RGBA', img.size, (255, 255, 255))
         img = Image.alpha_composite(background, img).convert("RGB")
@@ -141,23 +189,26 @@ class ImageViewsDataset(Dataset):
 
 test_images_folder='/fsx/proj-mod3d/dmitry/repos/hard_examples_preprocessed/img'
 do_preprocess=False
-views=[{ 'name': 'left', 'polar': 0.0, 'azimuth': -90.0, 'r': 0.0 },
-       { 'name': 'right', 'polar': 0.0, 'azimuth': 90.0, 'r': 0.0 },
-       { 'name': 'above', 'polar': -89.5, 'azimuth': 0.0, 'r': 0.0 },
-       { 'name': 'behind', 'polar': 0.0, 'azimuth': 180.0, 'r': 0.0 }]
-cfg_scales=[1.0, 3.0, 5.0]
-gpu=0
+views=[{ 'name': 'left', 'polar': 0.0, 'azimuth': -92.0, 'r': 0.0 },
+       { 'name': 'right', 'polar': 0.0, 'azimuth': 92.0, 'r': 0.0 },
+       { 'name': 'above', 'polar': -89., 'azimuth': 0.0, 'r': 0.0 },
+       { 'name': 'behind', 'polar': 0.0, 'azimuth': 177.0, 'r': 0.0 }]
+cfg_scales=[2.0, 3.0, 4.0]
+gpu=1
 device=f'cuda:{gpu}'
 batch_size=128
+img_size=256
 vae_cktp_path='/fsx/proj-mod3d/dmitry/vae.ckpt'
 clip_ckpt_path='/fsx/proj-mod3d/dmitry/clip.ckpt'
 
-dir_ckpt = '/fsx/proj-mod3d/dmitry/repos/zero123/zero123/logs/2023-07-24T14-59-57_sd-ext-objaverse-latents/checkpoints/trainstep_checkpoints'
-# dir_ckpt = './zero123XL'
-run_name='zero123_obj_hum_hheads_diffcolor_nobottom_2023-07-24'
-min_ckpt_step=56000
+dir_ckpt = '/fsx/proj-mod3d/dmitry/zero123logs/2023-07-11T18-28-40_sd-ext-objaverse-latents/checkpoints/trainstep_checkpoints'
+# run_name='zero123_obj_hum_hheads_diffcolor_nobottom_2023-07-24'
+run_name='zero123_obj_baseline_2023-07-11'
+min_ckpt_step=90000
+elev_cond=True
 run_dir=os.path.join('/fsx/proj-mod3d/dmitry/zero123_visualizations/', run_name)
 model_config='configs/sd-objaverse-finetune-c_concat-256.yaml'
+# model_config='configs/sd-objaverse-finetune-c_concat-512.yaml'
 config = OmegaConf.load(model_config)
 wandb_project = 'zero123_visualizations'
 wandb.init(project=wandb_project, name=run_name, id=run_name, entity='mod3d', save_code=False, resume='allow', reinit=True)
@@ -180,7 +231,8 @@ for ckpt in sorted(os.listdir(dir_ckpt)):
     print("\n*** STARTING VISUALIZATION RUN FOR CKPT STEP ", global_step, " ***")
 
 
-    dataset = ImageViewsDataset(test_images_folder, views, cfg_scales, preprocess=False)
+    dataset = ImageViewsDataset(test_images_folder, views, cfg_scales,
+                                img_size=img_size, elev_cond=elev_cond, preprocess=False)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0)
     out_dir_step = os.path.join(out_dir, f'step_{global_step}')
     if not os.path.exists(out_dir_step):
@@ -200,7 +252,8 @@ for ckpt in sorted(os.listdir(dir_ckpt)):
                     image_batch=img_views_tensor.moveaxis(0, 1),
                     image_original=(img_batch[i] + 1.0) / 2.0, 
                     col_names=[v['name'] for v in views], 
-                    row_names=[f'cfg_scale_{s}' for s in cfg_scales])
+                    row_names=[f'cfg_scale_{s}' for s in cfg_scales],
+                    imsize=img_size)
                 wandb_logger.experiment.log({img_name: wandb.Image(full_image_grid)}, step=global_step)
                 full_image_grid_img = transforms.ToPILImage()(full_image_grid)
                 full_image_grid_img.save(os.path.join(out_dir_step, f'{img_name}.png'))
