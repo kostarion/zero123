@@ -216,7 +216,7 @@ class ExtendedObjaverseDataModuleFromConfig(pl.LightningDataModule):
                  train=None, validation=None, test=None, num_workers=4, **kwargs):
         super().__init__(self)
         for dataset_params in datasets:
-            assert 'root_dir' in dataset_params and 'data_config_file' in dataset_params
+            assert 'root_dir' in dataset_params # and 'data_config_file' in dataset_params
         self.datasets_params = datasets
         self.batch_size = batch_size
         self.load_tensors = load_tensors
@@ -237,48 +237,39 @@ class ExtendedObjaverseDataModuleFromConfig(pl.LightningDataModule):
                                     transforms.Lambda(lambda x: rearrange(x * 2. - 1., 'c h w -> h w c'))])
         self.image_transforms = torchvision.transforms.Compose(image_transforms)
 
+    def create_dataloader(self, validation, image_transforms, create_sampler=True):
+        datasets = []
+        for dataset_params in self.datasets_params:
+            dataset = ExtendedObjaverseData(
+                root_dir=dataset_params.root_dir,
+                data_config_file=dataset_params.data_config_file if 'data_config_file' in dataset_params else None,
+                load_tensors=self.load_tensors,
+                total_view=self.total_view,
+                use_canonical_views=dataset_params.use_canonical_views,
+                color0_prob=dataset_params.color0_prob,
+                cond_polar_thr=dataset_params.cond_polar_thr,
+                elevation_cond=dataset_params.elevation_cond,
+                validation=validation,
+                image_transforms=image_transforms)
+            datasets.extend([dataset] * dataset_params.repeat if 'repeat' in dataset_params else [dataset])
+
+        dataset_combined = ConcatDataset(datasets)
+        if create_sampler:
+            sampler = DistributedSampler(dataset_combined)
+            return wds.WebLoader(dataset_combined, batch_size=self.batch_size,
+                                num_workers=self.num_workers,
+                                shuffle=False, sampler=sampler)
+        return wds.WebLoader(dataset_combined, batch_size=self.batch_size,
+                             num_workers=self.num_workers, shuffle=False)
+
     def train_dataloader(self):
-        datasets = [ExtendedObjaverseData(
-            root_dir=dataset_params.root_dir,
-            data_config_file=dataset_params.data_config_file,
-            load_tensors=self.load_tensors,
-            total_view=self.total_view,
-            color0_prob=dataset_params.color0_prob,
-            cond_polar_thr=dataset_params.cond_polar_thr,
-            elevation_cond=dataset_params.elevation_cond,
-            validation=False,
-            image_transforms=self.image_transforms) for dataset_params in self.datasets_params]
-        dataset = ConcatDataset(datasets)
-        sampler = DistributedSampler(dataset)
-        return wds.WebLoader(dataset, batch_size=self.batch_size, num_workers=self.num_workers, shuffle=False, sampler=sampler)
+        return self.create_dataloader(validation=False, image_transforms=self.image_transforms)
 
     def val_dataloader(self):
-        datasets = [ExtendedObjaverseData(
-            root_dir=dataset_params.root_dir,
-            data_config_file=dataset_params.data_config_file,
-            load_tensors=self.load_tensors,
-            total_view=self.total_view,
-            color0_prob=dataset_params.color0_prob,
-            cond_polar_thr=dataset_params.cond_polar_thr,
-            elevation_cond=dataset_params.elevation_cond,
-            validation=True,
-            image_transforms=self.image_transforms) for dataset_params in self.datasets_params]
-        dataset = ConcatDataset(datasets)
-        # sampler = DistributedSampler(dataset)
-        return wds.WebLoader(dataset, batch_size=self.batch_size, num_workers=self.num_workers, shuffle=False)
+        return self.create_dataloader(validation=True, image_transforms=self.image_transforms, create_sampler=False)
     
     def test_dataloader(self):
-        datasets = [ExtendedObjaverseData(
-            root_dir=dataset_params.root_dir,
-            data_config_file=dataset_params.data_config_file,
-            total_view=self.total_view,
-            load_tensors=self.load_tensors,
-            color0_prob=dataset_params.color0_prob,
-            cond_polar_thr=dataset_params.cond_polar_thr,
-            elevation_cond=dataset_params.elevation_cond,
-            validation=self.validation) for dataset_params in self.datasets_params]
-        dataset = ConcatDataset(datasets)
-        return wds.WebLoader(dataset, batch_size=self.batch_size, num_workers=self.num_workers, shuffle=False)
+        return self.create_dataloader(validation=self.validation, image_transforms=None, create_sampler=False)
 
 
 class ExtendedObjaverseData(Dataset):
@@ -290,9 +281,12 @@ class ExtendedObjaverseData(Dataset):
         postprocess=None,
         return_paths=False,
         total_view=54,
+        use_canonical_views=True,
+        num_canonical_views=6,
         color0_prob=0.5,
         cond_polar_thr=180,
         elevation_cond=False,
+        elevation_std=10.0,
         validation=False,
         ) -> None:
         """Create a dataset from a folder of images.
@@ -306,12 +300,15 @@ class ExtendedObjaverseData(Dataset):
             postprocess = instantiate_from_config(postprocess)
         self.postprocess = postprocess
         self.total_view = total_view
+        self.use_canonical_views = use_canonical_views
+        self.num_canonical_views = num_canonical_views
         self.color0_prob = color0_prob
         self.cond_polar_thr = cond_polar_thr
         self.load_tensors = load_tensors
         self.elevation_cond = elevation_cond
+        self.elevation_std = elevation_std
 
-        data_config_path = data_config_file if data_config_file else os.path.join(root_dir, 'valid_paths.json')
+        data_config_path = data_config_file if data_config_file else os.path.join(root_dir, 'data_config.json')
         with open(data_config_path) as f:
             self.paths = json.load(f)
             
@@ -373,7 +370,8 @@ class ExtendedObjaverseData(Dataset):
         d_r = target_r - cond_r
         
         if self.elevation_cond:
-            d_T = torch.tensor([d_polar, math.sin(d_azimuth), math.cos(d_azimuth), cond_polar])
+            randomized_polar_cond = np.clip(np.random.normal(cond_polar, self.elevation_std / 180. * math.pi), 0, math.pi)
+            d_T = torch.tensor([d_polar, math.sin(d_azimuth), math.cos(d_azimuth), randomized_polar_cond])
         else:
             d_T = torch.tensor([d_polar, math.sin(d_azimuth), math.cos(d_azimuth), d_r])
         return d_T
@@ -395,14 +393,15 @@ class ExtendedObjaverseData(Dataset):
         return data
     
     def get_indices(self, object_storage, total_view):
+        available_indices = [v for v in range(total_view) if (self.use_canonical_views or v >= self.num_canonical_views)]
         if self.cond_polar_thr > 0:
             cond_polar_thr_rad = self.cond_polar_thr / 180. * math.pi
-            polars = [(i, self.load_viewpoint(object_storage, i)[0]) for i in range(total_view)]
+            polars = [(i, self.load_viewpoint(object_storage, i)[0]) for i in available_indices]
             polars = [p for p in polars if p[1] < cond_polar_thr_rad]
             index_cond = random.choice(polars)[0]
-            index_target = random.choice([i for i in range(total_view-1) if i != index_cond])
+            index_target = random.choice([i for i in available_indices if i != index_cond])
         else:
-            index_target, index_cond = random.sample(range(total_view-1), 2)
+            index_target, index_cond = random.sample(available_indices, 2)
         return index_target, index_cond
 
     def __getitem__(self, index):
