@@ -563,12 +563,12 @@ if __name__ == "__main__":
 
             m, u = model.load_state_dict(old_state, strict=False)
 
-            if len(m) > 0:
-                rank_zero_print("missing keys:")
-                rank_zero_print(m)
-            if len(u) > 0:
-                rank_zero_print("unexpected keys:")
-                rank_zero_print(u)
+            # if len(m) > 0:
+            #     rank_zero_print("missing keys:")
+            #     rank_zero_print(m)
+            # if len(u) > 0:
+            #     rank_zero_print("unexpected keys:")
+            #     rank_zero_print(u)
 
         # trainer and callbacks
         trainer_kwargs = dict()
