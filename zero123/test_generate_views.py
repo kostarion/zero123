@@ -1,5 +1,5 @@
+import argparse
 import math
-import fire
 import numpy as np
 import os
 import torch
@@ -13,6 +13,14 @@ from torchvision import transforms
 from torchvision.utils import make_grid
 from torch.utils.data import Dataset, DataLoader
 
+
+VIEWS = [
+    { 'name': 'left', 'polar': 0.0, 'azimuth': -92.0, 'r': 0.0 },
+    { 'name': 'right', 'polar': 0.0, 'azimuth': 92.0, 'r': 0.0 },
+    { 'name': 'above', 'polar': -89., 'azimuth': 0.0, 'r': 0.0 },
+    { 'name': 'behind', 'polar': 0.0, 'azimuth': 177.0, 'r': 0.0 },
+    { 'name': 'right50_up20', 'polar': -20.0, 'azimuth': 50.0, 'r': 0.0 },
+]
 
 TESTSET_ELEVATIONS = {
     'alien1': 5,
@@ -49,16 +57,78 @@ TESTSET_ELEVATIONS = {
 }
 
 
-def filter_checkpoints(dir_ckpt):
-    for i, ckpt_name in enumerate(sorted(os.listdir(dir_ckpt))):
-        step_num = int(ckpt_name[18:27]) + 1
-        if step_num % 5000 == 0 and step_num % 10000 != 0 or step_num == 8000:
-        # if step_num % 10000 == 0:
-        # if step_num % 60000 == 0 and step_num % 120000 != 0 or step_num == 8000:
-            print(f'Leaving {step_num}')
-            continue
-        os.remove(os.path.join(dir_ckpt, ckpt_name))
-        print(f'Deleting {step_num}')
+def get_parser(**parser_kwargs):
+    parser = argparse.ArgumentParser(**parser_kwargs)
+
+    parser.add_argument(
+        "--dir_ckpt",
+        nargs="?",
+        type=str,
+        default="",
+        help="path to checkpoint or directory with checkpoints to load model states from"
+    )
+    parser.add_argument(
+        "--run_name",
+        nargs="?",
+        type=str,
+        default="zero123_baseline",
+        help="wandb name of the run, should be different for each dir_ckpt"
+    )
+    parser.add_argument(
+        "--model_config",
+        nargs="?",
+        type=str,
+        default="configs/sd-objaverse-finetune-c_concat-256.yaml",
+        help="path to model config yaml"
+    )
+    parser.add_argument(
+        "--test_images_folder",
+        nargs="?",
+        type=str,
+        default="/fsx/proj-mod3d/dmitry/repos/hard_examples_preprocessed/img",
+        help="folder with images"
+    )
+    parser.add_argument(
+        "--cfg_scales",
+        nargs="*",
+        type=float,
+        default=[2.0, 3.0, 4.0],
+    )
+    parser.add_argument(
+        "--preprocess",
+        action="store_true",
+    )
+    parser.set_defaults(preprocess=False)
+    parser.add_argument(
+        "--gpu",
+        type=int,
+        default=0,
+        help="gpu index to run on",
+    )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=64,
+    )
+    parser.add_argument(
+        "--img_size",
+        type=int,
+        default=256,
+    )
+    parser.add_argument(
+        "--vae_ckpt_path",
+        nargs="?",
+        type=str,
+        default="",
+        help="path to vae checkpoint to load model state from. if set, overrides main ckpt vae weights"
+    )
+    parser.add_argument(
+        "--clip_ckpt_path",
+        nargs="?",
+        type=str,
+        default="",
+        help="path to clip checkpoint to load model state from. if set, overrides main ckpt clip weights"
+    )
 
 def load_model_from_config(config, ckpt, device, vae_ckpt='', clip_ckpt='', verbose=False, min_step=0):
     print(f'Loading model from {ckpt}')
@@ -188,80 +258,69 @@ class ImageViewsDataset(Dataset):
         return img, T, img_name, view['name']
 
 
-test_images_folder='/fsx/proj-mod3d/dmitry/repos/hard_examples_preprocessed/img'
-do_preprocess=False
-views=[{ 'name': 'left', 'polar': 0.0, 'azimuth': -92.0, 'r': 0.0 },
-       { 'name': 'right', 'polar': 0.0, 'azimuth': 92.0, 'r': 0.0 },
-       { 'name': 'above', 'polar': -89., 'azimuth': 0.0, 'r': 0.0 },
-       { 'name': 'behind', 'polar': 0.0, 'azimuth': 177.0, 'r': 0.0 },
-       { 'name': 'right50_up20', 'polar': -20.0, 'azimuth': 50.0, 'r': 0.0 },
-       ]
-cfg_scales=[2.0, 3.0, 4.0]
-gpu=0
-device=f'cuda:{gpu}'
-batch_size=96
-img_size=256
-vae_cktp_path='/fsx/proj-mod3d/dmitry/vae.ckpt'
-clip_ckpt_path='/fsx/proj-mod3d/dmitry/clip.ckpt'
+if __name__ == "__main__":
+    parser = get_parser()
+    args = parser.parse_args()
 
-dir_ckpt = '/fsx/proj-mod3d/dmitry/zero123logs/2023-07-31T21-54-31_latents_objaverse_diffcolors/checkpoints/trainstep_checkpoints'
-# run_name='zero123_obj_hum_hheads_diffcolor_nobottom_2023-07-24'
-run_name='zero123XL_original_rerun'
-min_ckpt_step=100000
-finetuned_from_step=0
-elev_cond=False
-scale_cond=False
-run_dir=os.path.join('/fsx/proj-mod3d/dmitry/zero123_visualizations/', run_name)
-model_config='configs/sd-objaverse-finetune-c_concat-256.yaml'
-# model_config='configs/sd-objaverse-finetune-c_concat-512.yaml'
-config = OmegaConf.load(model_config)
-wandb_project = 'zero123_visualizations'
-wandb.init(project=wandb_project, name=run_name, id=run_name, entity='mod3d', save_code=False, resume='allow', reinit=True)
-wandb_logger = WandbLogger(project=wandb_project, name=run_name, id=run_name, save_dir=run_dir, offline=False)
-out_dir=os.path.join(run_dir, 'test_views')
-if not os.path.exists(out_dir):
-    os.makedirs(out_dir)
+    device=f'cuda:{args.gpu}'
 
-# filter_checkpoints(dir_ckpt)
+    # Sorry from the past 
+    min_ckpt_step=100000
+    finetuned_from_step=0
+    elev_cond=False
+    scale_cond=False
 
-for ckpt in ['/fsx/proj-mod3d/dmitry/repos/zero123/zero123/zero123XL/zero123-xl.ckpt']: # sorted(os.listdir(dir_ckpt)):
-    ckpt_path=os.path.join(dir_ckpt, ckpt)
-    model, global_step = load_model_from_config(
-        config, ckpt_path, f'cuda:{gpu}',
-        vae_ckpt='vae.ckpt', clip_ckpt='clip.ckpt',
-        verbose=True, min_step=min_ckpt_step)
-    if model is None:
-        continue
+    run_dir=os.path.join('/fsx/proj-mod3d/dmitry/zero123_visualizations/', args.run_name)
+    model_config='configs/sd-objaverse-finetune-c_concat-256.yaml'
+    # model_config='configs/sd-objaverse-finetune-c_concat-512.yaml'
+    config = OmegaConf.load(model_config)
+    wandb_project = 'zero123_visualizations'
+    wandb.init(project=wandb_project, name=args.run_name, id=args.run_name, entity='mod3d', save_code=False, resume='allow', reinit=True)
+    wandb_logger = WandbLogger(project=wandb_project, name=args.run_name, id=args.run_name, save_dir=run_dir, offline=False)
+    out_dir=os.path.join(run_dir, 'test_views')
+    if not os.path.exists(out_dir):
+        os.makedirs(out_dir)
 
-    print("\n*** STARTING VISUALIZATION RUN FOR CKPT STEP ", global_step, " ***")
+    # filter_checkpoints(dir_ckpt)
+
+    for ckpt in sorted(os.listdir(args.dir_ckpt)):
+        ckpt_path=os.path.join(args.dir_ckpt, ckpt)
+        model, global_step = load_model_from_config(
+            config, ckpt_path, f'cuda:{args.gpu}',
+            vae_ckpt='vae.ckpt', clip_ckpt='clip.ckpt',
+            verbose=True, min_step=min_ckpt_step)
+        if model is None:
+            continue
+
+        print("\n*** STARTING VISUALIZATION RUN FOR CKPT STEP ", global_step, " ***")
 
 
-    dataset = ImageViewsDataset(test_images_folder, views, cfg_scales,
-                                img_size=img_size, elev_cond=elev_cond, preprocess=False)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0)
-    out_dir_step = os.path.join(out_dir, f'step_{global_step}')
-    if not os.path.exists(out_dir_step):
-        os.mkdir(out_dir_step)
-    print(f'==== Saving to {out_dir_step} ======')
-    grids = {}
-    for img_batch, T_batch, img_names, view_names in dataloader:
-        novel_views = model.sample_novel_views(img_batch.to(device), T_batch.to(device),
-                                               scales=cfg_scales, scale_cond=scale_cond)
-        for i in range(len(img_names)):
-            img_name = img_names[i]
-            if img_name not in grids:
-                grids[img_name] = []
-            grids[img_name].append(novel_views[i].detach().cpu())
-            if len(grids[img_name]) == len(views):
-                img_views_tensor = torch.stack(grids[img_name])
-                full_image_grid = create_image_grid(
-                    image_batch=img_views_tensor.moveaxis(0, 1),
-                    image_original=(img_batch[i] + 1.0) / 2.0, 
-                    col_names=[v['name'] for v in views], 
-                    row_names=[f'cfg_scale_{s}' for s in cfg_scales],
-                    imsize=img_size)
-                wandb_logger.experiment.log({img_name: wandb.Image(full_image_grid)}, step=global_step+finetuned_from_step)
-                full_image_grid_img = transforms.ToPILImage()(full_image_grid)
-                full_image_grid_img.save(os.path.join(out_dir_step, f'{img_name}.png'))
-                print (f'==== Saved {img_name}.png ====')
-                del grids[img_name]
+        dataset = ImageViewsDataset(args.test_images_folder, VIEWS, args.cfg_scales,
+                                    img_size=args.img_size, elev_cond=elev_cond, preprocess=False)
+        dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=0)
+        out_dir_step = os.path.join(out_dir, f'step_{global_step}')
+        if not os.path.exists(out_dir_step):
+            os.mkdir(out_dir_step)
+        print(f'==== Saving to {out_dir_step} ======')
+        grids = {}
+        for img_batch, T_batch, img_names, view_names in dataloader:
+            novel_views = model.sample_novel_views(img_batch.to(device), T_batch.to(device),
+                                                scales=args.cfg_scales, scale_cond=scale_cond)
+            for i in range(len(img_names)):
+                img_name = img_names[i]
+                if img_name not in grids:
+                    grids[img_name] = []
+                grids[img_name].append(novel_views[i].detach().cpu())
+                if len(grids[img_name]) == len(VIEWS):
+                    img_views_tensor = torch.stack(grids[img_name])
+                    full_image_grid = create_image_grid(
+                        image_batch=img_views_tensor.moveaxis(0, 1),
+                        image_original=(img_batch[i] + 1.0) / 2.0, 
+                        col_names=[v['name'] for v in VIEWS], 
+                        row_names=[f'cfg_scale_{s}' for s in args.cfg_scales],
+                        imsize=args.img_size)
+                    wandb_logger.experiment.log({img_name: wandb.Image(full_image_grid)}, step=global_step+finetuned_from_step)
+                    full_image_grid_img = transforms.ToPILImage()(full_image_grid)
+                    full_image_grid_img.save(os.path.join(out_dir_step, f'{img_name}.png'))
+                    print (f'==== Saved {img_name}.png ====')
+                    del grids[img_name]
