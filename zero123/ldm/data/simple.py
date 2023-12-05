@@ -314,7 +314,9 @@ class ExtendedObjaverseData(Dataset):
             
         total_objects = len(self.paths)
         if validation:
-            self.paths = self.paths[math.floor(total_objects / 100. * 99.):] # used last 1% as validation
+            self.paths = self.paths # [math.floor(total_objects / 100. * 99.):] # used last 1% as validation
+            import random
+            random.shuffle(self.paths)
         else:
             self.paths = self.paths[:math.floor(total_objects / 100. * 99.)] # used first 99% as training
         print('============= length of dataset %d =============' % len(self.paths))
@@ -376,11 +378,23 @@ class ExtendedObjaverseData(Dataset):
             d_T = torch.tensor([d_polar, math.sin(d_azimuth), math.cos(d_azimuth), d_r])
         return d_T
 
+    def get_background_ratio(self, img):
+        return (np.array(img)[..., 3] != 0).sum() / img.height / img.width
+
     def extract_data(self, object_storage, index_target, index_cond, color_idx=0):
         data = {}
         if not self.load_tensors:
-            data["image_target"] = self.process_img(self.load_img(object_storage, index_target))
-            data["image_cond"] = self.process_img(self.load_img(object_storage, index_cond))
+            img_target = self.load_img(object_storage, index_target)
+            img_cond = self.load_img(object_storage, index_cond)
+            data["image_target"] = self.process_img(img_target)
+            data["image_cond"] = self.process_img(img_cond)
+
+            data["background_ratio_target"] = self.get_background_ratio(img_target)
+            data["background_ratio_cond"] = self.get_background_ratio(img_cond)
+            data["target_polar"], data["target_azimuth"], _ = \
+                self.load_viewpoint(object_storage, index_target)
+            data["cond_polar"], data["cond_azimuth"], _ = \
+                self.load_viewpoint(object_storage, index_cond)
         else:
             data["latent_target"] = self.load_tensor(object_storage, index_target, color_idx=color_idx)
             data["latent_cond"] = self.load_tensor(object_storage, index_cond, color_idx=color_idx)
@@ -425,6 +439,7 @@ class ExtendedObjaverseData(Dataset):
             total_view = min(total_view, len([f for f in object_files if re.findall(r'frame_(\d+).json', f)]))
         else:
             total_view = len([f for f in object_files if re.findall(r'rgba/rgba_(\d+).png', f)])
+            total_view = min(total_view, len([f for f in object_files if re.findall(r'frame_(\d+).json', f)]))
 
         # TODO: remove
         if total_view < 48:
@@ -448,7 +463,8 @@ class ExtendedObjaverseData(Dataset):
             data = self.extract_data(object_storage, index_target, index_cond, color_idx=color_idx)
             return self.__getitem__((index + 1) % len(self.paths))
 
-        # data['object_name'] = object_name
+        data['object_name'] = object_name
+        data['index_target'], data['index_cond'] = index_target, index_cond
 
         if self.postprocess is not None:
             data = self.postprocess(data)

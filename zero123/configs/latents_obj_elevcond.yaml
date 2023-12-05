@@ -59,11 +59,12 @@ data:
     load_tensors: True
     datasets:
       - root_dir: /scratch/objaverse_untar
-        # data_config_file: /fsx/proj-mod3d/dmitry/repos/zero123/zero123/good_objaverse_dirs.json
+        data_config_file: /fsx/proj-mod3d/dmitry/repos/zero123/zero123/objaverse_filtered_by_nc.json
         # data_config_file: /fsx/proj-mod3d/dmitry/repos/zero123/zero123/good_objaverse_obj_dirs_shard_dirs.json
         color0_prob: 1.0
         cond_polar_thr: 180
         elevation_cond: True
+        use_canonical_views: True
         repeats: 1
       # - root_dir: /fsx/proj-mod3d/objaverse-render-latents
       #   data_config_file: /fsx/proj-mod3d/dmitry/repos/zero123/zero123/good_objaverse_render_tars.json

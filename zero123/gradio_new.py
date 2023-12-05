@@ -59,12 +59,15 @@ def load_model_from_config(config, ckpt, device, verbose=False):
     sd = pl_sd['state_dict']
     model = instantiate_from_config(config.model)
     m, u = model.load_state_dict(sd, strict=False)
-    if len(m) > 0 and verbose:
-        print('missing keys:')
-        print(m)
-    if len(u) > 0 and verbose:
-        print('unexpected keys:')
-        print(u)
+    
+    vae_ckpt='vae.ckpt'
+    if vae_ckpt:
+        print(f'Loading VAE from {vae_ckpt}')
+        model.first_stage_model.load_state_dict(torch.load(vae_ckpt))
+    clip_ckpt='clip.ckpt'
+    if clip_ckpt:
+        print(f'Loading CLIP from {clip_ckpt}')
+        model.cond_stage_model.load_state_dict(torch.load(clip_ckpt))
 
     model.to(device)
     model.eval()

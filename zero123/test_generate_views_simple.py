@@ -52,7 +52,7 @@ TESTSET_ELEVATIONS = {
 def filter_checkpoints(dir_ckpt):
     for i, ckpt_name in enumerate(sorted(os.listdir(dir_ckpt))):
         step_num = int(ckpt_name[18:27]) + 1
-        if step_num % 5000 == 0 and step_num % 10000 != 0 or step_num == 8000:
+        if step_num % 5000 == 0 and step_num % 10000 != 0:
         # if step_num % 10000 == 0:
         # if step_num % 60000 == 0 and step_num % 120000 != 0 or step_num == 8000:
             print(f'Leaving {step_num}')
@@ -86,7 +86,7 @@ def load_model_from_config(config, ckpt, device, vae_ckpt='', clip_ckpt='', verb
         print(f'Loading CLIP from {clip_ckpt}')
         model.cond_stage_model.load_state_dict(torch.load(clip_ckpt))
 
-    model.to(device)
+    model.cuda()
     model.eval()
     return model, global_step
 
@@ -197,19 +197,19 @@ views=[{ 'name': 'left', 'polar': 0.0, 'azimuth': -92.0, 'r': 0.0 },
        { 'name': 'right50_up20', 'polar': -20.0, 'azimuth': 50.0, 'r': 0.0 },
        ]
 cfg_scales=[2.0, 3.0, 4.0]
-gpu=0
-device=f'cuda:{gpu}'
+gpu=4
+torch.cuda.set_device(gpu)
 batch_size=96
 img_size=256
 vae_cktp_path='/fsx/proj-mod3d/dmitry/vae.ckpt'
 clip_ckpt_path='/fsx/proj-mod3d/dmitry/clip.ckpt'
 
-dir_ckpt = '/fsx/proj-mod3d/dmitry/zero123logs/2023-07-31T21-54-31_latents_objaverse_diffcolors/checkpoints/trainstep_checkpoints'
-# run_name='zero123_obj_hum_hheads_diffcolor_nobottom_2023-07-24'
-run_name='zero123XL_original_rerun'
-min_ckpt_step=100000
+dir_ckpt = '/fsx/proj-mod3d/dmitry/zero123logs/2023-11-30T20-42-47_latents_objaverse_elevcond_no_by_nc/checkpoints/trainstep_checkpoints'
+run_name='zero123_obj_elevcond_no_by_nc_2023-11-30'
+# run_name='zero123XL_original_rerun'
+min_ckpt_step=15000
 finetuned_from_step=0
-elev_cond=False
+elev_cond=True
 scale_cond=False
 run_dir=os.path.join('/fsx/proj-mod3d/dmitry/zero123_visualizations/', run_name)
 model_config='configs/sd-objaverse-finetune-c_concat-256.yaml'
@@ -222,9 +222,9 @@ out_dir=os.path.join(run_dir, 'test_views')
 if not os.path.exists(out_dir):
     os.makedirs(out_dir)
 
-# filter_checkpoints(dir_ckpt)
+filter_checkpoints(dir_ckpt)
 
-for ckpt in ['/fsx/proj-mod3d/dmitry/repos/zero123/zero123/zero123XL/zero123-xl.ckpt']: # sorted(os.listdir(dir_ckpt)):
+for ckpt in sorted(os.listdir(dir_ckpt)):
     ckpt_path=os.path.join(dir_ckpt, ckpt)
     model, global_step = load_model_from_config(
         config, ckpt_path, f'cuda:{gpu}',
@@ -245,7 +245,7 @@ for ckpt in ['/fsx/proj-mod3d/dmitry/repos/zero123/zero123/zero123XL/zero123-xl.
     print(f'==== Saving to {out_dir_step} ======')
     grids = {}
     for img_batch, T_batch, img_names, view_names in dataloader:
-        novel_views = model.sample_novel_views(img_batch.to(device), T_batch.to(device),
+        novel_views = model.sample_novel_views(img_batch.cuda(), T_batch.cuda(),
                                                scales=cfg_scales, scale_cond=scale_cond)
         for i in range(len(img_names)):
             img_name = img_names[i]

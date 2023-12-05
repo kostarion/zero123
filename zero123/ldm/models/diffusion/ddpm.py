@@ -20,6 +20,7 @@ from tqdm import tqdm
 from torchvision.utils import make_grid
 from pytorch_lightning.utilities.distributed import rank_zero_only
 from omegaconf import ListConfig
+import os
 
 from ldm.util import log_txt_as_img, exists, default, ismap, isimage, mean_flat, count_params, instantiate_from_config
 from ldm.modules.ema import LitEma
@@ -813,7 +814,7 @@ class LatentDiffusion(DDPM):
                 xc = xc[:bs]
             encoder_posterior = self.encode_first_stage(x)
             z = self.get_first_stage_encoding(encoder_posterior).detach()
-            z_cond = self.encode_first_stage(xc).mode().detach()
+            z_cond = self.encode_first_stage(xc).mode().detach() * self.scale_factor
         else:
             z = self.get_input_latent(batch, k).to(self.device)
             z_cond = self.get_input_latent(batch, cond_key).to(self.device) / self.scale_factor # to match the original zero123 interface
@@ -839,6 +840,10 @@ class LatentDiffusion(DDPM):
         random = torch.rand(T.size(0), device=self.device)
         prompt_mask = rearrange(random < 2 * uncond, "n -> n 1 1")
         input_mask = 1 - rearrange((random >= uncond).float() * (random < 3 * uncond).float(), "n -> n 1 1 1")
+        # prompt_mask_vals = (random < 2 * uncond)
+        # prompt_mask = rearrange(prompt_mask_vals, "n -> n 1 1")
+        # input_mask_vals = 1 - (random >= uncond).float() * (random < 3 * uncond).float()
+        # input_mask = rearrange(input_mask_vals, "n -> n 1 1 1")
 
         # z.shape: [8, 4, 64, 64]; c.shape: [8, 1, 768]
         # print('=========== xc shape ===========', xc.shape)
@@ -854,6 +859,7 @@ class LatentDiffusion(DDPM):
             out.append(xc)
         # print(out)
         # raise Exception
+        # out.extend([prompt_mask_vals, input_mask_vals])
         return out
 
     # @torch.no_grad()
@@ -960,6 +966,45 @@ class LatentDiffusion(DDPM):
         x, c = self.get_input(batch, self.first_stage_key)
         loss = self(x, c)
         return loss
+        # x, c, prompt_mask_vals, input_mask_vals = self.get_input(batch, self.first_stage_key)
+        # loss, t = self(x, c)
+
+        # names = batch['object_name']
+        # back_ratio_target = batch['background_ratio_target']
+        # back_ratio_cond = batch['background_ratio_cond']
+        # polar_target = batch['target_polar']
+        # polar_cond = batch['cond_polar']
+        # azimuth_target = batch['target_azimuth']
+        # azimuth_cond = batch['cond_azimuth']
+        # index_target = batch['index_target']
+        # index_cond = batch['index_cond']
+
+        # log_strings = []
+        # for i in range(len(names)):
+        #     log_strings.append(','.join([
+        #         str(t[i].cpu().item()),
+        #         str(back_ratio_cond[i].cpu().item()),
+        #         str(back_ratio_target[i].cpu().item()),
+        #         str(polar_cond[i].cpu().item()),
+        #         str(polar_target[i].cpu().item()),
+        #         str(azimuth_cond[i].cpu().item()),
+        #         str(azimuth_target[i].cpu().item()),
+        #         str(int(prompt_mask_vals[i].cpu().item())),
+        #         str(int(input_mask_vals[i].cpu().item())),
+        #         names[i],
+        #         str(index_cond[i].cpu().item()),
+        #         str(index_target[i].cpu().item()),
+        #         str(loss[2][i].cpu().item())
+        #         ]) + '\n')
+
+        # log_dir = 'loss_study/5'
+        # # log_dir = self.logger.save_dir
+        # if not os.path.exists(log_dir):
+        #     os.makedirs(log_dir)
+        # with open(os.path.join(log_dir, f'log_losses_{self.device.index}.csv'), 'a') as f:
+        #     f.writelines(log_strings)
+        
+        # return loss[0], loss[1]
 
     def forward(self, x, c, *args, **kwargs):
         t = torch.randint(0, self.num_timesteps, (x.shape[0],), device=self.device).long()
@@ -970,7 +1015,7 @@ class LatentDiffusion(DDPM):
             if self.shorten_cond_schedule:  # TODO: drop this option
                 tc = self.cond_ids[t].to(self.device)
                 c = self.q_sample(x_start=c, t=tc, noise=torch.randn_like(c.float()))
-        return self.p_losses(x, c, t, *args, **kwargs)
+        return self.p_losses(x, c, t, *args, **kwargs) #, t
 
     def _rescale_annotations(self, bboxes, crop_coordinates):  # TODO: move to dataset
         def rescale_bbox(bbox):
@@ -1117,13 +1162,13 @@ class LatentDiffusion(DDPM):
         loss_dict.update({f'{prefix}/loss_simple': loss_simple.mean()})
 
         logvar_t = self.logvar.to(t.device)[t].to(self.device)
-        loss = loss_simple / torch.exp(logvar_t) + logvar_t
+        loss_batch = loss_simple / torch.exp(logvar_t) + logvar_t
         # loss = loss_simple / torch.exp(self.logvar) + self.logvar
         if self.learn_logvar:
-            loss_dict.update({f'{prefix}/loss_gamma': loss.mean()})
+            loss_dict.update({f'{prefix}/loss_gamma': loss_batch.mean()})
             loss_dict.update({'logvar': self.logvar.data.mean()})
 
-        loss = self.l_simple_weight * loss.mean()
+        loss = self.l_simple_weight * loss_batch.mean()
 
         loss_vlb = self.get_loss(model_output, target, mean=False).mean(dim=(1, 2, 3))
         loss_vlb = (self.lvlb_weights[t] * loss_vlb).mean()
@@ -1131,7 +1176,7 @@ class LatentDiffusion(DDPM):
         loss += (self.original_elbo_weight * loss_vlb)
         loss_dict.update({f'{prefix}/loss': loss})
 
-        return loss, loss_dict
+        return loss, loss_dict #, loss_batch
 
     def p_mean_variance(self, x, c, t, clip_denoised: bool, return_codebook_ids=False, quantize_denoised=False,
                         return_x0=False, score_corrector=None, corrector_kwargs=None):
@@ -1356,8 +1401,10 @@ class LatentDiffusion(DDPM):
         return cond
     
     @torch.no_grad()
-    def sample_novel_views(self, imgs, T, scales=[3.0], ddim_steps=200, ddim_eta=1.0):
-        cond_latent = self.encode_first_stage((imgs)).mode().detach() # * self.scale_factor # TEMPORAL!
+    def sample_novel_views(self, imgs, T, scales=[3.0], ddim_steps=200, ddim_eta=1.0, scale_cond=False):
+        cond_latent = self.encode_first_stage((imgs)).mode().detach()
+        if scale_cond:
+            cond_latent *= self.scale_factor # TEMPORAL!
         print(f'Scale factor: {self.scale_factor}')
         cond_emb = self.get_learned_conditioning(imgs).detach()
         

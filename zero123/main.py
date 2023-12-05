@@ -563,6 +563,15 @@ if __name__ == "__main__":
 
             m, u = model.load_state_dict(old_state, strict=False)
 
+            # vae_ckpt, clip_ckpt = 'vae.ckpt', 'clip.ckpt'
+            # # vae_ckpt, clip_ckpt = '', ''
+            # if True:
+            #     print(f'Loading VAE from {vae_ckpt}')
+            #     model.first_stage_model.load_state_dict(torch.load(vae_ckpt))
+            # if True:
+            #     print(f'Loading CLIP from {clip_ckpt}')
+            #     model.cond_stage_model.load_state_dict(torch.load(clip_ckpt))
+
             # if len(m) > 0:
             #     rank_zero_print("missing keys:")
             #     rank_zero_print(m)
